@@ -140,9 +140,10 @@ pkill -f portal_typed.py                     # hard kill if stuck
 
 ---
 
-## Driver prompt for the target machine's Claude
+## Driver prompt for the target machine's coding assistant
 
-> Paste the following to Claude Code on the new machine, with this bundle present.
+> Paste the following to your AI coding assistant (Claude Code, Cursor, Codex
+> CLI, Gemini CLI, etc.) on the new machine, with this bundle present.
 
 You're setting up a replicated voice-dictation tool on this machine. The bundle
 is in this directory. Do this:
