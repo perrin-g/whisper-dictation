@@ -1,0 +1,21 @@
+[Unit]
+Description=Whisper dictation resident typist (holds one RemoteDesktop portal session)
+Documentation=file://%h/.local/share/whisper-dictation/portal_typed.py
+# Needs the graphical session bus + portal to be up.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/whisper-dictation/venv/bin/python %h/.local/share/whisper-dictation/portal_typed.py
+Restart=on-failure
+RestartSec=2
+# Hardening: this process only needs to talk to the session bus and type.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+PrivateTmp=true
+
+[Install]
+WantedBy=graphical-session.target

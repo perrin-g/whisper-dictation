@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Toggle dictation: first invocation starts recording, second stops, transcribes,
+# and types the result into the focused window via the RemoteDesktop portal.
+#
+# State lives in $XDG_RUNTIME_DIR (user-only tmpfs). A flock guards against
+# double-press races. The recorder/transcriber/typer are overridable via env
+# vars so the state machine can be exercised with stubs in tests.
+set -euo pipefail
+
+BASE="${WD_BASE:-$HOME/.local/share/whisper-dictation}"
+PY="$BASE/venv/bin/python"
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}"
+WAV="$RUNTIME/dictate.wav"
+PIDFILE="$RUNTIME/dictate.pid"
+LOCK="$RUNTIME/dictate.lock"
+
+# Overridable commands (defaults are the real tools).
+RECORD_CMD="${WD_RECORD_CMD:-pw-record --rate 16000 --channels 1 --format s16}"
+TRANSCRIBE_CMD="${WD_TRANSCRIBE_CMD:-$PY $BASE/transcribe.py}"
+TYPE_CMD="${WD_TYPE_CMD:-$PY $BASE/portal_type.py}"
+NOTIFY_CMD="${WD_NOTIFY_CMD:-notify-send}"
+
+notify() { $NOTIFY_CMD "Dictation" "$1" 2>/dev/null || true; }
+
+# True if the default audio source is muted. Overridable for tests; a missing
+# wpctl (or any probe failure) is treated as "not muted" so dictation still works.
+MUTE_CHECK_CMD="${WD_MUTE_CHECK_CMD:-wpctl get-volume @DEFAULT_AUDIO_SOURCE@}"
+mic_muted() {
+  # shellcheck disable=SC2086
+  $MUTE_CHECK_CMD 2>/dev/null | grep -q MUTED
+}
+
+daemon_alive() {
+  # Probe liveness with an actual connect, not just file existence - a stale
+  # socket from a crashed daemon would pass [ -S ] but fail here.
+  local sock="$RUNTIME/whisper-dictation.sock"
+  [ -S "$sock" ] && socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null
+}
+
+start_recording() {
+  if ! daemon_alive; then
+    notify "whisper daemon not running - approve the prompt to start it, then try again"
+    systemctl --user start whisper-typist 9>&- &
+    return
+  fi
+  if mic_muted; then
+    notify "mic is muted - unmute to dictate"
+    return
+  fi
+  # Detach the recorder's stdio and close the lock FD (9) in the child so it
+  # neither holds the caller's pipes nor the flock for the whole recording -
+  # otherwise the next press deadlocks. shellcheck disable=SC2086
+  $RECORD_CMD "$WAV" </dev/null >/dev/null 2>&1 9>&- &
+  echo $! > "$PIDFILE"
+  notify "recording... (press again to stop)"
+}
+
+stop_and_transcribe() {
+  local pid
+  pid="$(cat "$PIDFILE")"
+  rm -f "$PIDFILE"
+  # Guard against a stale PIDFILE whose PID was recycled by an unrelated process.
+  if kill -0 "$pid" 2>/dev/null && grep -q "pw-record" /proc/"$pid"/cmdline 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  if [ ! -s "$WAV" ]; then
+    notify "no audio captured"
+    rm -f "$WAV"
+    return
+  fi
+
+  local text
+  # shellcheck disable=SC2086
+  if ! text="$($TRANSCRIBE_CMD "$WAV")"; then
+    notify "transcribe failed"
+    rm -f "$WAV"
+    return
+  fi
+  rm -f "$WAV"
+
+  # strip a trailing newline so we never accidentally submit a form/command
+  text="${text%$'\n'}"
+
+  if [ -z "$text" ]; then
+    notify "nothing transcribed"
+    return
+  fi
+
+  # shellcheck disable=SC2086
+  if printf '%s' "$text" | $TYPE_CMD; then
+    notify "typed: $text"
+  else
+    notify "type failed - restart: systemctl --user restart whisper-typist"
+  fi
+}
+
+main() {
+  exec 9>"$LOCK"
+  # Non-blocking: if another invocation holds the lock (e.g. a transcribe is
+  # in progress), drop this press rather than queueing it - avoids stacking.
+  flock -n 9 || { notify "busy, ignoring press"; exit 0; }
+  if [ -f "$PIDFILE" ]; then
+    stop_and_transcribe
+  else
+    start_recording
+  fi
+}
+
+main "$@"
