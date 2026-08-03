@@ -78,6 +78,8 @@ layer is GNOME/Wayland-specific, not distro-specific.
 bash install.sh
 ```
 
+## Usage
+
 `Super+\` works at any time, including when the daemon isn't running yet - it
 starts the service for you. On first `Super+\` **this login**, if the
 `whisper-typist` daemon is not running you'll get a notification saying so,
