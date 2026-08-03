@@ -78,10 +78,12 @@ layer is GNOME/Wayland-specific, not distro-specific.
 bash install.sh
 ```
 
-On first `Super+\` **this login**, if the `whisper-typist` daemon is not running
-you'll get a notification saying so, followed immediately by the GNOME consent
-prompt to start the service. Approve it. The daemon then holds that grant open
-so no further prompts until the service restarts or you log out.
+`Super+\` works at any time, including when the daemon isn't running yet - it
+starts the service for you. On first `Super+\` **this login**, if the
+`whisper-typist` daemon is not running you'll get a notification saying so,
+followed immediately by the GNOME consent prompt to start the service.
+Approve it, then press `Super+\` again to dictate. The daemon then holds that
+grant open so no further prompts until the service restarts or you log out.
 
 ## What's in here
 
@@ -110,9 +112,10 @@ whisper-dictation/         # program files + full test suite
 - **Restart costs a prompt.** `systemctl --user restart whisper-typist` tears
   down the held session, so the next start re-prompts. Single-prompt-per-login
   holds only while the service starts once at login and stays up.
-- **Daemon not running.** If `Super+\` is pressed and the daemon is not running
-  (e.g. you cancelled the consent prompt earlier), you'll see a notification
-  and the consent prompt appears immediately. Approve to start the service, then
+- **Daemon not running.** `Super+\` can be pressed at any time - if the daemon
+  is not running (e.g. you cancelled the consent prompt earlier, or this is the
+  first use this login), you'll see a notification and the consent prompt
+  appears immediately, starting the service. Approve to start the service, then
   press `Super+\` again to dictate. Cancelling exits the daemon cleanly - it
   will not loop re-prompting.
 - **Notifications are honest.** The daemon acks `OK`/`ERR` to the client after
