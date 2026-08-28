@@ -24,6 +24,8 @@ def make_env(runtime, record="record", transcribe="transcribe", typer="typer"):
     # (the real wpctl would report the tester's actual mic state); the mute
     # test overrides this back to a MUTED-reporting stub.
     env["WD_MUTE_CHECK_CMD"] = "true"  # prints nothing -> grep MUTED fails
+    # pretend daemon is always alive so tests don't depend on a real socket
+    env["WD_DAEMON_CHECK_CMD"] = "true"
     return env
 
 
@@ -175,6 +177,58 @@ def test_empty_audio_handled():
         assert r.returncode == 0, r.stderr
         assert not os.path.exists(os.path.join(rt, "dictate.wav")), "empty wav removed"
         assert not os.path.exists(typed), "nothing should be typed for empty audio"
+
+
+def test_stale_empty_pidfile_starts_fresh_recording():
+    """Stale PIDFILE with empty content (e.g. after session lock) cleans up and
+    starts a new recording instead of routing to stop_and_transcribe."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        # Plant a stale PIDFILE with empty content and a stale wav
+        pidfile = os.path.join(rt, "dictate.pid")
+        wav = os.path.join(rt, "dictate.wav")
+        with open(pidfile, "w") as f:
+            f.write("")
+        with open(wav, "wb") as f:
+            f.write(b"staleaudio")
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        # Stale wav must be deleted, new recording must have started (new PIDFILE)
+        assert not os.path.exists(wav) or os.path.getsize(wav) != 10, \
+            "stale wav should be replaced by new recording"
+        assert os.path.exists(pidfile), "new recording should have written a PIDFILE"
+        # cleanup lingering stub recorder
+        with open(pidfile) as f:
+            try:
+                os.kill(int(f.read()), 9)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+def test_stale_dead_pid_starts_fresh_recording():
+    """Stale PIDFILE with a dead PID (e.g. pw-record crashed) cleans up and
+    starts a new recording."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        pidfile = os.path.join(rt, "dictate.pid")
+        wav = os.path.join(rt, "dictate.wav")
+        with open(pidfile, "w") as f:
+            f.write("999999\n")  # PID that will never exist
+        with open(wav, "wb") as f:
+            f.write(b"staleaudio")
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        assert os.path.exists(pidfile), "new recording should have written a PIDFILE"
+        pid_content = open(pidfile).read().strip()
+        assert pid_content != "999999", "PIDFILE must hold new PID, not the stale one"
+        # cleanup
+        with open(pidfile) as f:
+            try:
+                os.kill(int(f.read()), 9)
+            except (ProcessLookupError, ValueError):
+                pass
 
 
 if __name__ == "__main__":

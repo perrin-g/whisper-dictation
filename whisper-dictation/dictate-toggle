@@ -30,11 +30,17 @@ mic_muted() {
   $MUTE_CHECK_CMD 2>/dev/null | grep -q MUTED
 }
 
+DAEMON_CHECK_CMD="${WD_DAEMON_CHECK_CMD:-}"
+
 daemon_alive() {
   # Probe liveness with an actual connect, not just file existence - a stale
   # socket from a crashed daemon would pass [ -S ] but fail here.
-  local sock="$RUNTIME/whisper-dictation.sock"
-  [ -S "$sock" ] && socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null
+  if [ -n "$DAEMON_CHECK_CMD" ]; then
+    $DAEMON_CHECK_CMD
+  else
+    local sock="$RUNTIME/whisper-dictation.sock"
+    [ -S "$sock" ] && socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null
+  fi
 }
 
 start_recording() {
@@ -47,6 +53,9 @@ start_recording() {
     notify "mic is muted - unmute to dictate"
     return
   fi
+  # Safety net: kill any orphaned recorder before starting a new one so we never
+  # have two pw-record processes writing to the same wav concurrently.
+  _kill_orphaned_recorder
   # Detach the recorder's stdio and close the lock FD (9) in the child so it
   # neither holds the caller's pipes nor the flock for the whole recording -
   # otherwise the next press deadlocks. shellcheck disable=SC2086
@@ -96,13 +105,28 @@ stop_and_transcribe() {
   fi
 }
 
+_kill_orphaned_recorder() {
+  # Kill any pw-record still writing to the wav (e.g. orphaned after session lock
+  # broke the PIDFILE so stop_and_transcribe could not kill it normally).
+  pkill -f "pw-record.*${WAV##*/}" 2>/dev/null || true
+}
+
 main() {
   exec 9>"$LOCK"
   # Non-blocking: if another invocation holds the lock (e.g. a transcribe is
   # in progress), drop this press rather than queueing it - avoids stacking.
   flock -n 9 || { notify "busy, ignoring press"; exit 0; }
   if [ -f "$PIDFILE" ]; then
-    stop_and_transcribe
+    local pid
+    pid="$(cat "$PIDFILE")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      stop_and_transcribe
+    else
+      _kill_orphaned_recorder
+      notify "previous recording lost (session interrupted)"
+      rm -f "$PIDFILE" "$WAV"
+      start_recording
+    fi
   else
     start_recording
   fi
