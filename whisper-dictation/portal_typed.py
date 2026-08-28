@@ -80,6 +80,11 @@ def handle_connection(conn, inject):
         return
     try:
         inject(text)
+    except ConsentDenied:
+        # Portal session lost consent (e.g. after screen lock). Exit with failure
+        # so systemd Restart=on-failure brings up a fresh session automatically.
+        _reply(conn, b"ERR")
+        raise
     except Exception as exc:  # one bad utterance must not kill the daemon
         sys.stderr.write(f"inject failed: {exc!r}\n")
         _reply(conn, b"ERR")
@@ -284,8 +289,8 @@ def main():
     try:
         establish_session(state)  # take the one consent prompt up front, at startup
     except ConsentDenied as exc:
-        # User cancelled or denied - exit cleanly so Restart=on-failure does not
-        # restart us in a loop re-prompting indefinitely.
+        # User cancelled or denied at startup - exit cleanly so Restart=on-failure
+        # does not restart us in a loop re-prompting indefinitely.
         sys.stderr.write(f"consent not granted: {exc}\n")
         sys.exit(0)
 
@@ -299,7 +304,13 @@ def main():
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
 
-    serve(default_socket_path(), inject, should_stop=lambda: stopping["flag"])
+    try:
+        serve(default_socket_path(), inject, should_stop=lambda: stopping["flag"])
+    except ConsentDenied as exc:
+        # Mid-session consent lost (e.g. screen lock invalidated the portal
+        # session). Exit with failure so systemd restarts with a fresh session.
+        sys.stderr.write(f"session lost consent: {exc}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

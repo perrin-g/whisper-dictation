@@ -120,11 +120,16 @@ whisper-dictation/         # program files + full test suite
   appears immediately, starting the service. Approve to start the service, then
   press `Super+\` again to dictate. Cancelling exits the daemon cleanly - it
   will not loop re-prompting.
+- **Screen lock recovery is automatic.** If the session is locked mid-recording
+  (e.g. `Super+L`), the portal session is invalidated. On the next injection
+  attempt the daemon detects `ConsentDenied`, exits with failure, and systemd
+  restarts it within 2 seconds. The next `Super+\` re-prompts once and then
+  works normally. No manual restart needed.
 - **Notifications are honest.** The daemon acks `OK`/`ERR` to the client after
-  each inject. If its held portal session has died (e.g. it logs
-  `Invalid state`), the toggle shows "type failed - restart..." instead of
-  falsely claiming "typed: ...". The fix when you see that is a daemon restart
-  (one prompt). The daemon does NOT fall back to a one-shot session on failure -
+  each inject. If its held portal session has died for a reason other than
+  consent (e.g. compositor restart), the toggle shows "type failed - restart..."
+  instead of falsely claiming "typed: ...". The fix is a daemon restart (one
+  prompt). The daemon does NOT fall back to a one-shot session on failure -
   that would silently re-prompt - it fails loudly instead.
 - **Hash mismatch on `pip install`** means the target's Python/arch wants a
   different wheel. Regenerate hashes on the target (`pip download` then hash, or
