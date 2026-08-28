@@ -179,6 +179,20 @@ def test_empty_audio_handled():
         assert not os.path.exists(typed), "nothing should be typed for empty audio"
 
 
+def test_daemon_down_warns_and_does_not_record():
+    """First press when daemon is not alive must notify and NOT start recording."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_DAEMON_CHECK_CMD"] = "false"  # daemon not alive
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
+            "daemon down must not start recording"
+        assert not os.path.exists(os.path.join(rt, "dictate.wav")), \
+            "daemon down must not create a wav"
+
+
 def test_stale_empty_pidfile_starts_fresh_recording():
     """Stale PIDFILE with empty content (e.g. after session lock) cleans up and
     starts a new recording instead of routing to stop_and_transcribe."""
