@@ -5,9 +5,12 @@ Holds ONE xdg-desktop-portal RemoteDesktop session open for the whole login
 session, so the GNOME consent prompt fires once at startup instead of on every
 dictation. Listens on a unix socket ($XDG_RUNTIME_DIR/whisper-dictation.sock,
 mode 0600); each client connection sends UTF-8 text, which the daemon types into
-the focused window through the held session. If the portal session has died
-(e.g. compositor restart), injection transparently re-establishes it - which
-re-prompts - and retries once.
+the focused window through the held session.
+
+Subscribes to the portal session Closed signal (via a GLib mainloop thread) so
+the daemon exits cleanly when the screen locks, unlinking the socket. This means
+dictate-toggle's daemon_alive check returns false immediately after unlock, and
+the first Super+backslash press triggers re-consent rather than a wasted recording cycle.
 
 The socket-serving layer (serve / handle_connection) is decoupled from D-Bus: it
 takes an `inject` callable, so the protocol is unit-testable with a stub injector
@@ -18,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 from portal_type import DEVICE_KEYBOARD, text_to_keysyms
@@ -30,6 +34,9 @@ _MAX_RECV = 65536  # 64 KB; no utterance is larger
 
 class ConsentDenied(Exception):
     """User cancelled or denied the portal consent prompt."""
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code  # portal response code: 1 = user cancelled, 2 = portal error
 
 
 PATH = "/org/freedesktop/portal/desktop"
@@ -147,15 +154,16 @@ def _unlink_quietly(path):
 
 def _notify_consent_pending():
     """Best-effort desktop notification explaining the portal prompt that is
-    about to appear. The portal's own dialog text is fixed by the compositor
-    and cannot be customised, so this fires just before it to give context."""
+    about to appear. Returns the notification ID so the caller can dismiss it
+    once the session is established."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             [
                 "notify-send",
                 "--app-name=Whisper Dictation",
                 "--urgency=critical",  # stays on screen until dismissed, not missed if away
                 "--expire-time=0",
+                "--print-id",
                 "Whisper Dictation needs one-time permission",
                 "The next prompt lets it type transcribed speech into your "
                 "focused window (keyboard input only - no mouse/touch, no "
@@ -163,13 +171,37 @@ def _notify_consent_pending():
             ],
             check=False,
             timeout=3,
+            capture_output=True,
+            text=True,
+        )
+        time.sleep(2.5)  # give the user time to read it before the portal dialog steals focus
+        return result.stdout.strip() or None
+    except OSError:
+        return None  # notify-send missing; the portal prompt still works without it
+
+
+def _dismiss_consent_notification(notif_id):
+    """Replace the persistent consent notification with a short-lived ready message."""
+    if not notif_id:
+        return
+    try:
+        subprocess.run(
+            [
+                "notify-send",
+                "--app-name=Whisper Dictation",
+                f"--replace-id={notif_id}",
+                "--expire-time=3000",
+                "Whisper Dictation",
+                "Ready - press the dictation key to start.",
+            ],
+            check=False,
+            timeout=3,
         )
     except OSError:
-        pass  # notify-send missing; the portal prompt still works without it
-    time.sleep(2.5)  # give the user time to read it before the portal dialog steals focus
+        pass
 
 
-def establish_session(state):
+def establish_session(state, notify=True):
     """Open a RemoteDesktop keyboard session and keep its bus connection in
     `state`. Blocks on the consent prompt; on success state has bus/handle set."""
     import gi
@@ -177,7 +209,8 @@ def establish_session(state):
     gi.require_version("Gio", "2.0")
     from gi.repository import GLib, Gio
 
-    _notify_consent_pending()
+    if notify:
+        state["_consent_notif_id"] = _notify_consent_pending()
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     sender = bus.get_unique_name()[1:].replace(".", "_")
@@ -198,7 +231,7 @@ def establish_session(state):
     def on_response(conn, sndr, path, iface, signal, params, step):
         code, results = params.unpack()
         if code != 0:
-            local["error"] = ConsentDenied(f"{step} cancelled/failed (code {code})")
+            local["error"] = ConsentDenied(f"{step} cancelled/failed (code {code})", code=code)
             loop.quit()
             return
         try:
@@ -278,8 +311,13 @@ def make_injector(state):
         try:
             _emit(state, text)
         except Exception:
-            establish_session(state)  # session likely died; re-grant + retry
-            _emit(state, text)
+            try:
+                establish_session(state, notify=False)  # session died; re-grant + retry silently
+                _emit(state, text)
+            except Exception as exc:
+                # Retry also failed - session is unrecoverable. Exit so systemd
+                # restarts with a fresh portal session after RestartSec.
+                raise ConsentDenied(f"session unrecoverable after retry: {exc}") from exc
     return inject
 
 
@@ -289,15 +327,42 @@ def main():
     try:
         establish_session(state)  # take the one consent prompt up front, at startup
     except ConsentDenied as exc:
-        # User cancelled or denied at startup - exit cleanly so Restart=on-failure
-        # does not restart us in a loop re-prompting indefinitely.
         sys.stderr.write(f"consent not granted: {exc}\n")
-        sys.exit(0)
+        # code 1 = user explicitly cancelled: exit 0 so systemd does not
+        # restart us in a loop re-prompting indefinitely.
+        # Any other code (e.g. 2 = portal in bad state after screen lock)
+        # exits 1 so systemd retries after RestartSec, by which time the
+        # portal should have recovered.
+        sys.exit(0 if exc.code == 1 else 1)
+
+    # Replace the persistent consent notification now that the session is ready.
+    _dismiss_consent_notification(state.get("_consent_notif_id"))
 
     stopping = {"flag": False}
+    GLib = state["GLib"]
+    Gio = state["Gio"]
+    glib_loop = GLib.MainLoop()
+
+    def on_session_closed(*_):
+        # Lock screen (or compositor restart) invalidated our portal session.
+        # Exit cleanly so the socket is unlinked; dictate-toggle will start a
+        # fresh session the next time the user presses Super+\.
+        sys.stderr.write("portal session closed; exiting for re-consent on next use\n")
+        stopping["flag"] = True
+        glib_loop.quit()
+
+    state["bus"].signal_subscribe(
+        None, "org.freedesktop.portal.Session", "Closed",
+        state["handle"], None, Gio.DBusSignalFlags.NONE,
+        on_session_closed, None,
+    )
+
+    glib_thread = threading.Thread(target=glib_loop.run, daemon=True)
+    glib_thread.start()
 
     def on_term(_signo, _frame):
         stopping["flag"] = True
+        glib_loop.quit()
 
     # On SIGTERM/SIGINT, break out of the accept loop so serve()'s finally
     # block unlinks the socket - leaving a clean state for the next start.
@@ -311,6 +376,9 @@ def main():
         # session). Exit with failure so systemd restarts with a fresh session.
         sys.stderr.write(f"session lost consent: {exc}\n")
         sys.exit(1)
+    finally:
+        glib_loop.quit()
+        glib_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

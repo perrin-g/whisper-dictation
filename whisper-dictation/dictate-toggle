@@ -45,7 +45,7 @@ daemon_alive() {
 
 start_recording() {
   if ! daemon_alive; then
-    notify "whisper daemon not running - approve the prompt to start it, then try again"
+    notify "starting Whisper Dictation - approve the prompt, then press the dictation key"
     systemctl --user start whisper-typist 9>&- &
     return
   fi
@@ -101,7 +101,10 @@ stop_and_transcribe() {
   if printf '%s' "$text" | $TYPE_CMD; then
     notify "typed: $text"
   else
-    notify "type failed - restart: systemctl --user restart whisper-typist"
+    notify "restarting Whisper Dictation - try again shortly"
+    # Daemon exited due to lost portal session; bypass systemd RestartSec so the
+    # consent dialog appears immediately rather than after the 15s restart delay.
+    systemctl --user start whisper-typist 9>&- &
   fi
 }
 

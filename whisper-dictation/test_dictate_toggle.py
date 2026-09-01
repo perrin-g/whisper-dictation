@@ -179,18 +179,46 @@ def test_empty_audio_handled():
         assert not os.path.exists(typed), "nothing should be typed for empty audio"
 
 
-def test_daemon_down_warns_and_does_not_record():
-    """First press when daemon is not alive must notify and NOT start recording."""
+def test_daemon_down_fails_to_start_does_not_record():
+    """First press when daemon never starts must notify failure and NOT start recording."""
     with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
         rec, tr, ty, _ = write_stubs(sd)
         env = make_env(rt, rec, tr, ty)
-        env["WD_DAEMON_CHECK_CMD"] = "false"  # daemon not alive
+        env["WD_DAEMON_CHECK_CMD"] = "false"  # daemon never comes alive
+        env["WD_DAEMON_START_CMD"] = "true"   # no-op service start
+        env["WD_DAEMON_START_WAIT"] = "2"     # fast timeout for tests
+        env["WD_DAEMON_START_POLL"] = "0"     # no sleep between polls
         r = run_toggle(env)
         assert r.returncode == 0, r.stderr
         assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
-            "daemon down must not start recording"
+            "daemon timeout must not start recording"
         assert not os.path.exists(os.path.join(rt, "dictate.wav")), \
-            "daemon down must not create a wav"
+            "daemon timeout must not create a wav"
+
+
+def test_daemon_down_then_starts_shows_ready_no_recording():
+    """First press when daemon starts during the wait must show ready and NOT auto-record."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        # A counter file: daemon_check returns false until it has been called twice,
+        # then returns true - simulates daemon coming up after a short delay.
+        counter = os.path.join(sd, "daemon_calls")
+        daemon_check = os.path.join(sd, "daemon_check.sh")
+        with open(daemon_check, "w") as f:
+            f.write(f'#!/usr/bin/env bash\n'
+                    f'n=$(cat {counter!r} 2>/dev/null || echo 0)\n'
+                    f'echo $((n+1)) > {counter!r}\n'
+                    f'[ "$n" -ge 2 ]\n')
+        os.chmod(daemon_check, 0o755)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_DAEMON_CHECK_CMD"] = f"bash {daemon_check}"
+        env["WD_DAEMON_START_CMD"] = "true"   # no-op service start
+        env["WD_DAEMON_START_WAIT"] = "10"
+        env["WD_DAEMON_START_POLL"] = "0"
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
+            "daemon startup press must not auto-start recording"
 
 
 def test_stale_empty_pidfile_starts_fresh_recording():
