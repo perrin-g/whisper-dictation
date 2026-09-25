@@ -80,30 +80,6 @@ whisper-dictation/         # program files + full test suite
   so the daemon exits cleanly (it watches the session `Closed` signal) and unlinks
   its socket; `systemctl --user restart` does the same deliberately. Either way the
   next press re-prompts. Nothing else does.
-- **Never bind an injecting action to a modified hotkey.** Mutter's virtual input
-  device shares the real keymap state, so a modifier still physically down when
-  injection starts is combined with every keysym sent: `t` arrives as `Super+t` and
-  fires whatever owns that hotkey, space as `Super+space`, `l` as `Super+L` (screen
-  lock), and a held Shift uppercases everything and turns `,` into `<`. Releasing
-  the modifiers first does *not* fix it - a virtual device cannot clear a key held
-  on the real keyboard, and GNOME exposes no way to read the modifier state. The
-  mitigations are a `WD_SETTLE_MS` (250 ms) wait for the key to lift, which is why
-  dictation is safe in practice (transcription adds a second of cover), and keeping
-  recovery on the clipboard rather than a second injecting hotkey. `--retype` still
-  exists for the command line, where nothing is held.
-- **Nothing detects a stolen focus**, because GNOME on Wayland exposes no
-  supported way to read the focused window (`org.gnome.Shell.Eval` is locked, no
-  `wlr-foreign-toplevel`). The portal types wherever focus is at inject time, so
-  instead of guessing, the design makes a miss cheap to undo: every transcript is
-  stashed at `$XDG_RUNTIME_DIR/dictate.last` (0600) *before* the inject, and copied
-  to the clipboard, so `Ctrl+V` or `dictate-toggle --retype` recovers it. The
-  clipboard is the widest exposure of the three: XWayland bridges it, so any X11
-  client can read it without focus, and it lingers until the next copy. Harden with
-  `WD_CLIP_CMD="wl-copy --paste-once"` if that matters more to you than pasting
-  twice. On tmpfs the stash never reaches disk and dies with the login session - but
-  it follows the script's `/tmp` fallback if `XDG_RUNTIME_DIR` is unset, which may
-  be real disk. Notifications truncate past 40 chars, since the shell keeps
-  notification history.
 - **Mic follows your headset.** Every press re-picks: a connected headset
   (Bluetooth or USB) beats the built-in mic, and a webcam mic ranks *below* it.
   `pick-source` ranks by device class (`device.form-factor` / `device.bus`), not by
@@ -118,6 +94,70 @@ whisper-dictation/         # program files + full test suite
 - **Hash mismatch on `pip install`** means the target's Python/arch wants a
   different wheel. Regenerate hashes on the target — keep them pinned, don't
   drop `--require-hashes`.
+
+## Caveats
+
+Read these before trusting it with anything sensitive.
+
+- **Each transcript ends up in three places.** All are readable by anything running
+  as your user; what differs is how routine that read is.
+
+  | | Where | Read by | Lifetime | How much |
+  |---|---|---|---|---|
+  | Stash | `$XDG_RUNTIME_DIR/dictate.last`, tmpfs | only by opening that exact path | until the next dictation; gone at logout | full text |
+  | Clipboard | `wl-copy` memory | focused Wayland apps, **plus any X11 client, unfocused, any time** | until your next copy | full text |
+  | Notification | gnome-shell | on-screen; session-bus eavesdropping | until dismissed | first 40 chars |
+
+  The clipboard is the widest: XWayland bridges it, so polling it is normal,
+  unremarkable behaviour for any X11 app you happen to be running.
+
+- **So don't dictate credentials.** Not because of a specific hole - because three
+  copies exist and one of them is the clipboard.
+
+- **A clipboard-history extension changes the picture.** Pano, Clipboard Indicator
+  and friends log every copy *to disk*. Install one and every dictation becomes a
+  permanent on-disk record. Nothing here persists to disk today.
+
+- **`wl-copy --paste-once` is not recommended**, despite looking like the obvious
+  hardening. Apps frequently request the selection more than once for type
+  negotiation, which consumes it early and makes the paste appear broken. Set
+  `WD_CLIP_CMD` if you want it anyway.
+
+- **Nothing detects a stolen focus.** GNOME on Wayland exposes no supported way to
+  read the focused window (`org.gnome.Shell.Eval` is locked, no
+  `wlr-foreign-toplevel`), so the portal types wherever focus is at inject time. The
+  design makes a miss cheap to undo rather than detectable: `Ctrl+V`, or
+  `dictate-toggle --retype`.
+
+- **Holding the trigger key can still corrupt a transcript.** Mutter's virtual input
+  device shares the real keymap state, so a modifier physically down when injection
+  starts combines with every keysym: `t` arrives as `Super+t` and fires whatever owns
+  that hotkey, `l` as `Super+L` (screen lock), and a held Shift uppercases the text
+  and turns `,` into `<`. Releasing the modifiers first does **not** fix it - a
+  virtual device cannot clear a key held on the real keyboard, and there is no API
+  to read the modifier state. The mitigation is a `WD_SETTLE_MS` (250 ms) wait plus
+  the second of transcription, which covers a normal press but is **not a
+  guarantee**. If you see it recur, move dictation to a key with no modifier
+  (`Insert` is usually free) - that removes the cause rather than mitigating it.
+  This is also why recovery is the clipboard and not a second hotkey, and why
+  `--retype` is command-line only.
+
+- **The stash follows a `/tmp` fallback** if `XDG_RUNTIME_DIR` is unset, and `/tmp`
+  may be real disk. With it set (normal on a systemd login) the stash is tmpfs and
+  never touches disk.
+
+- **A Bluetooth headset mic may transcribe *worse* than your built-in one.** Headset
+  capture runs over HFP/HSP, which is narrowband (CVSD at 8 kHz, mSBC at 16 kHz),
+  while a decent laptop array mic is wideband and clean. `pick-source` prefers the
+  headset because that is usually what you want when wearing one, but if accuracy
+  drops when it connects, pin the built-in mic with
+  `WD_SOURCE=alsa_input.<your-device>` - `pick-source` prints the node names.
+
+- **`small.en` is a small model.** It is chosen for speed and offline use, not
+  accuracy: it guesses badly at isolated letters, spelled-out words and unusual
+  proper nouns. Dictate whole sentences and it does well; test it with the alphabet
+  and it will disappoint you. Swap the model in `transcribe.py` (and `model.sha256`)
+  if you want better at the cost of latency.
 
 ## Controls
 
