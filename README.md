@@ -30,9 +30,11 @@ compositor-mediated channel GNOME uses for screen-sharing and remote-control:
 ## Requirements
 
 - GNOME (Shell 50+) on **Wayland**
-- PipeWire (`pw-record`)
+- PipeWire (`pw-record` to capture, `pw-dump` to enumerate mics) and `jq`
 - System Python 3 with distro PyGObject
 - `socat`
+- `wpctl` (WirePlumber) for the mute guard - optional, a missing `wpctl` just
+  skips the check
 - ~500 MB disk for the `small.en` model
 
 ## Install
@@ -65,10 +67,11 @@ whisper-dictation/         # program files + full test suite
   portal_type.py           # socket client -> daemon
   portal_typed.py          # resident typist daemon (holds the portal session)
   dictate-toggle           # flock toggle: record <-> stop+transcribe+type
+  pick-source              # ranks mics: headset first, built-in mic as fallback
   whisper-typist.service   # systemd --user unit (hardened)
   requirements.txt         # pinned + hash-verified deps
   model.sha256             # expected model checksums (verified on install)
-  test_*.py                # 40+ tests, run by install.sh before enabling service
+  test_*.py                # 59 tests, run by install.sh before enabling service
 ```
 
 ## Notes
@@ -83,6 +86,19 @@ whisper-dictation/         # program files + full test suite
   seconds of approving it.
 - **Restart costs a prompt.** `systemctl --user restart whisper-typist` tears
   down the held session, so the next start re-prompts.
+- **Mic follows your headset.** Every press re-picks the mic: a connected headset
+  (Bluetooth or USB) wins, otherwise the built-in mic. `pick-source` ranks by
+  device class (`device.form-factor` / `device.bus` from `pw-dump`) rather than by
+  a hardcoded device, so a new headset works the first time you pair it. A headset
+  in playback-only (A2DP) profile publishes no capture node and so cannot be
+  picked - the mic has to be live, not just paired. A webcam mic ranks *below* the
+  built-in one. The recorder is pinned with `--target`, so this is independent of
+  the system default input: dictation can use the headset while Teams and Chrome
+  stay on whatever you set. The "recording via ..." notification names the mic in
+  use, and the mute guard checks *that* mic. Run `pick-source` to see what would
+  be used right now, or set `WD_SOURCE=<node.name>` to prefer one device (it still
+  falls back when that device is absent). A failed probe degrades to the default
+  source rather than blocking dictation.
 - **en-NZ spelling** is a curated word map — not blanket suffix rules (those
   mis-fire on size/prize/doctor/error). High-collision words (check/cheque,
   tire/tyre, curb/kerb, draft/draught) are left untouched. Extend in `en_nz.py`.

@@ -22,12 +22,32 @@ NOTIFY_CMD="${WD_NOTIFY_CMD:-notify-send}"
 
 notify() { $NOTIFY_CMD "Dictation" "$1" 2>/dev/null || true; }
 
-# True if the default audio source is muted. Overridable for tests; a missing
+# Mic selection: prefer a connected headset (Bluetooth or USB), else the
+# built-in mic. WD_SOURCE names a node to prefer over the ranking (it still
+# falls back when that device isn't connected).
+PICK_SOURCE_CMD="${WD_PICK_SOURCE_CMD:-$BASE/pick-source}"
+SRC_TARGET=""   # node.name for pw-record --target ("" = PipeWire default)
+SRC_ID="@DEFAULT_AUDIO_SOURCE@"   # node id for wpctl
+SRC_DESC=""     # human-readable name, for notifications
+
+resolve_source() {
+  local line
+  # shellcheck disable=SC2086
+  line="$($PICK_SOURCE_CMD "${WD_SOURCE:-}" 2>/dev/null || true)"
+  # No capture device found (or the probe failed): leave the defaults in place
+  # and let pw-record pick the default source, as it did before.
+  [ -n "$line" ] || return 0
+  SRC_ID="$(printf '%s' "$line" | cut -f1)"
+  SRC_TARGET="$(printf '%s' "$line" | cut -f2)"
+  SRC_DESC="$(printf '%s' "$line" | cut -f3)"
+}
+
+# True if the chosen audio source is muted. Overridable for tests; a missing
 # wpctl (or any probe failure) is treated as "not muted" so dictation still works.
-MUTE_CHECK_CMD="${WD_MUTE_CHECK_CMD:-wpctl get-volume @DEFAULT_AUDIO_SOURCE@}"
+MUTE_CHECK_CMD="${WD_MUTE_CHECK_CMD:-wpctl get-volume}"
 mic_muted() {
   # shellcheck disable=SC2086
-  $MUTE_CHECK_CMD 2>/dev/null | grep -q MUTED
+  $MUTE_CHECK_CMD "$SRC_ID" 2>/dev/null | grep -q MUTED
 }
 
 DAEMON_CHECK_CMD="${WD_DAEMON_CHECK_CMD:-}"
@@ -49,19 +69,28 @@ start_recording() {
     systemctl --user start whisper-typist 9>&- &
     return
   fi
+  resolve_source
   if mic_muted; then
-    notify "mic is muted - unmute to dictate"
+    notify "${SRC_DESC:-mic} is muted - unmute to dictate"
     return
   fi
   # Safety net: kill any orphaned recorder before starting a new one so we never
   # have two pw-record processes writing to the same wav concurrently.
   _kill_orphaned_recorder
+  # Pin the recorder to the chosen mic; with no target it would follow whatever
+  # PipeWire's default source happens to be.
+  local target=()
+  [ -n "$SRC_TARGET" ] && target=(--target "$SRC_TARGET")
   # Detach the recorder's stdio and close the lock FD (9) in the child so it
   # neither holds the caller's pipes nor the flock for the whole recording -
   # otherwise the next press deadlocks. shellcheck disable=SC2086
-  $RECORD_CMD "$WAV" </dev/null >/dev/null 2>&1 9>&- &
+  $RECORD_CMD "${target[@]}" "$WAV" </dev/null >/dev/null 2>&1 9>&- &
   echo $! > "$PIDFILE"
-  notify "recording... (press again to stop)"
+  if [ -n "$SRC_DESC" ]; then
+    notify "recording via $SRC_DESC (press again to stop)"
+  else
+    notify "recording... (press again to stop)"
+  fi
 }
 
 stop_and_transcribe() {

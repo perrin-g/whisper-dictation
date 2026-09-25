@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Pick the mic to dictate with: a headset (Bluetooth or USB) when one is
+# connected, otherwise the built-in mic.
+#
+# Usage: pick-source [preferred-node-name]
+# Prints one line: <node-id><TAB><node.name><TAB><description>
+# Prints nothing (exit 0) if no capture device exists, so the caller can fall
+# back to the system default source rather than failing.
+#
+# A preferred node name wins outright when that node is live; when it isn't
+# (that headset is off or unpaired) ranking proceeds as normal, so pinning a
+# device never leaves dictation with no mic.
+#
+# Ranking is by device class, not by a hardcoded device name, so any headset
+# wins as soon as it connects. A Bluetooth headset in A2DP (playback-only)
+# profile has no source node at all, so it cannot be picked - the mic has to
+# actually be present, not just the headset paired.
+set -euo pipefail
+
+DUMP_CMD="${WD_PW_DUMP_CMD:-pw-dump}"
+
+# A failed or unparseable probe must print nothing and still exit 0: the caller
+# reads empty output as "fall back to the default source".
+# shellcheck disable=SC2086
+dump="$($DUMP_CMD 2>/dev/null || true)"
+[ -n "$dump" ] || exit 0
+
+printf '%s' "$dump" | jq -r --arg prefer "${1:-}" '
+  # device.form-factor / device.bus live on the Device object, not the Node,
+  # so index devices by id and join each source node to its device.
+  ( [ .[]
+      | select(.type == "PipeWire:Interface:Device")
+      | { key: (.id | tostring), value: (.info.props // {}) }
+    ] | from_entries ) as $devs
+  | [ .[]
+      | select(.type == "PipeWire:Interface:Node")
+      | { id: .id, p: (.info.props // {}) }
+      | select((.p["media.class"] // "") | startswith("Audio/Source"))
+      # monitor sources are loopbacks of output, never a mic
+      | select(((.p["node.name"] // "") | test("\\.monitor$")) | not)
+      | . + { d: ($devs[((.p["device.id"] // -1) | tostring)] // {}) }
+      | { id: .id,
+          name: (.p["node.name"] // ""),
+          desc: (.p["node.description"] // .p["node.nick"] // .p["node.name"] // ""),
+          # newest node wins a tie: with two headsets connected, prefer the one
+          # plugged in or paired most recently
+          serial: (.p["object.serial"] // 0),
+          ff: ((.d["device.form-factor"] // .p["device.form-factor"] // "") | ascii_downcase),
+          bus: ((.d["device.bus"] // .p["device.bus"] // "") | ascii_downcase) }
+      | select(.name != "")
+      | . + { score:
+          ( if ($prefer != "" and .name == $prefer) then 1000
+            elif (.ff | test("headset|headphone|hands-?free")) then 100
+            # webcam is checked before the bus rules: a webcam mic sits on USB
+            # but is a worse dictation mic than the built-in one
+            elif (.ff | test("webcam")) then 5
+            elif .bus == "bluetooth" then 90
+            elif .bus == "usb" then 80
+            elif (.ff | test("internal")) or .bus == "pci" then 10
+            else 30 end ) }
+    ]
+  | sort_by([.score, .serial])
+  | reverse
+  | if length == 0 then empty else .[0] | "\(.id)\t\(.name)\t\(.desc)" end
+'

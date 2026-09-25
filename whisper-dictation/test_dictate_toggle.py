@@ -20,6 +20,9 @@ def make_env(runtime, record="record", transcribe="transcribe", typer="typer"):
     env["WD_TRANSCRIBE_CMD"] = f"bash {transcribe}"
     env["WD_TYPE_CMD"] = f"bash {typer}"
     env["WD_NOTIFY_CMD"] = "true"  # swallow notifications
+    # no source probe by default: pw-dump isn't available in a test sandbox, and
+    # an empty pick means "use the PipeWire default", the pre-picker behaviour
+    env["WD_PICK_SOURCE_CMD"] = "true"
     # force "not muted" by default so the mute guard never blocks these tests
     # (the real wpctl would report the tester's actual mic state); the mute
     # test overrides this back to a MUTED-reporting stub.
@@ -34,9 +37,15 @@ def write_stubs(d, *, record_writes=b"AUDIODATA", transcript="hello world"):
     transcribe = os.path.join(d, "transcribe")
     typer = os.path.join(d, "typer")
     typed_out = os.path.join(d, "typed.txt")
-    # record: $1 is the wav path; write bytes and sleep so it stays "running"
+    # record: the wav path is the LAST arg (as with real pw-record, which takes
+    # options such as --target before the file); log argv so tests can assert
+    # what the recorder was invoked with. Sleep so it stays "running".
+    args_out = os.path.join(d, "record_args.txt")
     with open(record, "w") as f:
-        f.write(f'#!/usr/bin/env bash\nprintf %s {record_writes.decode()!r} > "$1"\nsleep 30\n')
+        f.write(f'#!/usr/bin/env bash\n'
+                f'printf "%s\\n" "$*" >> {args_out!r}\n'
+                f'printf %s {record_writes.decode()!r} > "${{@: -1}}"\n'
+                f'sleep 30\n')
     # transcribe: $1 is wav; emit the canned transcript verbatim (incl. any
     # real newlines) by cat-ing a fixture file, so escapes aren't mangled.
     fixture = os.path.join(d, "transcript.txt")
@@ -271,6 +280,111 @@ def test_stale_dead_pid_starts_fresh_recording():
                 os.kill(int(f.read()), 9)
             except (ProcessLookupError, ValueError):
                 pass
+
+
+def write_picker(d, line):
+    """A pick-source stub printing one <id>\\t<name>\\t<desc> line (or nothing).
+
+    The line is cat-ed from a fixture so real tabs survive (printf %s would keep
+    a literal backslash-t and the caller's cut -f would see one field).
+    """
+    fixture = os.path.join(d, "picked.txt")
+    with open(fixture, "w") as f:
+        f.write(line)
+    p = os.path.join(d, "picker")
+    with open(p, "w") as f:
+        f.write(f'#!/usr/bin/env bash\ncat {fixture!r}\n')
+    os.chmod(p, 0o755)
+    return f"bash {p}"
+
+
+def wait_for(path, timeout=5.0):
+    """The recorder is backgrounded; give it a moment to write its side effects."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def write_mute_check(d, muted_id):
+    """A wpctl stub reporting MUTED only for the given node id ($1)."""
+    p = os.path.join(d, "mute_check")
+    with open(p, "w") as f:
+        f.write(f'#!/usr/bin/env bash\n[ "$1" = {muted_id!r} ] && echo "Volume: 1.00 [MUTED]"\n'
+                f'exit 0\n')
+    os.chmod(p, 0o755)
+    return f"bash {p}"
+
+
+def _kill_recorder(rt):
+    pidfile = os.path.join(rt, "dictate.pid")
+    if not os.path.exists(pidfile):
+        return
+    with open(pidfile) as f:
+        try:
+            os.kill(int(f.read()), 9)
+        except (ProcessLookupError, ValueError):
+            pass
+
+
+def test_recorder_is_pinned_to_picked_source():
+    """The mic chosen by pick-source must be passed to the recorder as --target,
+    so dictation uses the headset even when it isn't the system default."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_PICK_SOURCE_CMD"] = write_picker(sd, "77\tbluez_input.AA\tHeadset X")
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        args_file = os.path.join(sd, "record_args.txt")
+        try:
+            assert wait_for(args_file), "recorder never ran"
+            args = open(args_file).read()
+            assert "--target bluez_input.AA" in args, \
+                f"recorder must be pinned to the picked source, got {args!r}"
+        finally:
+            _kill_recorder(rt)
+
+
+def test_no_pick_falls_back_to_default_source():
+    """With no capture device found (or a failed probe) the recorder must run
+    untargeted, i.e. follow PipeWire's default source as it did before."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_PICK_SOURCE_CMD"] = "false"  # probe fails, prints nothing
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        args_file = os.path.join(sd, "record_args.txt")
+        try:
+            assert os.path.exists(os.path.join(rt, "dictate.pid")), \
+                "a failed source probe must not stop dictation"
+            assert wait_for(args_file), "recorder never ran"
+            args = open(args_file).read()
+            assert "--target" not in args, f"expected no target, got {args!r}"
+        finally:
+            _kill_recorder(rt)
+
+
+def test_mute_check_targets_picked_node():
+    """The mute guard must test the picked mic, not the system default - the
+    headset can be live while the default source sits muted, and vice versa."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_PICK_SOURCE_CMD"] = write_picker(sd, "77\tbluez_input.AA\tHeadset X")
+        # reports MUTED only when asked about node 77 (the picked one)
+        env["WD_MUTE_CHECK_CMD"] = write_mute_check(sd, "77")
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        try:
+            assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
+                "muted picked mic must not start recording"
+        finally:
+            _kill_recorder(rt)
 
 
 if __name__ == "__main__":

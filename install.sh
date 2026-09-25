@@ -29,18 +29,19 @@ echo "  desktop: ${XDG_CURRENT_DESKTOP:-unknown}  session: ${XDG_SESSION_TYPE:-u
 # --- 1. system packages ---------------------------------------------------
 say "System packages"
 # We need: PyGObject + GLib introspection (portal D-Bus client), PipeWire's
-# pw-record (mic capture), libnotify's notify-send (toasts), python3 venv.
+# pw-record (mic capture) and pw-dump + jq (mic ranking in pick-source),
+# libnotify's notify-send (toasts), python3 venv.
 if command -v apt-get >/dev/null; then
-  PKGS="python3-gi gir1.2-glib-2.0 python3-venv pipewire-bin libnotify-bin"
+  PKGS="python3-gi gir1.2-glib-2.0 python3-venv pipewire-bin libnotify-bin jq"
   INSTALL="sudo apt-get install -y $PKGS"
 elif command -v dnf >/dev/null; then
-  PKGS="python3-gobject glib2 pipewire-utils libnotify"
+  PKGS="python3-gobject glib2 pipewire-utils libnotify jq"
   INSTALL="sudo dnf install -y $PKGS"
 elif command -v pacman >/dev/null; then
-  PKGS="python-gobject glib2 pipewire libnotify"
+  PKGS="python-gobject glib2 pipewire libnotify jq"
   INSTALL="sudo pacman -S --needed $PKGS"
 else
-  die "no known package manager (apt/dnf/pacman). Install PyGObject, GLib introspection, pipewire (pw-record), libnotify manually, then re-run with WD_SKIP_PKGS=1."
+  die "no known package manager (apt/dnf/pacman). Install PyGObject, GLib introspection, pipewire (pw-record, pw-dump), jq, libnotify manually, then re-run with WD_SKIP_PKGS=1."
 fi
 if [ "${WD_SKIP_PKGS:-0}" = "1" ]; then
   echo "  WD_SKIP_PKGS=1 -> skipping package install"
@@ -57,6 +58,10 @@ mkdir -p "$SHARE" "$BIN" "$(dirname "$UNIT")"
 cp "$SRC"/transcribe.py "$SRC"/portal_type.py "$SRC"/portal_typed.py \
    "$SRC"/en_nz.py "$SRC"/requirements.txt "$SRC"/model.sha256 "$SHARE/"
 cp "$SRC"/test_*.py "$SHARE/"
+# pick-source lives beside the program files, not in $BIN: dictate-toggle calls
+# it as "$BASE/pick-source", and test_pick_source.py runs it from there.
+cp "$SRC"/pick-source "$SHARE/pick-source"
+chmod +x "$SHARE/pick-source"
 cp "$SRC"/dictate-toggle "$BIN/dictate-toggle"
 chmod +x "$BIN/dictate-toggle"
 cp "$SRC"/whisper-typist.service "$UNIT"
