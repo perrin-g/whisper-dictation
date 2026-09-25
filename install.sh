@@ -131,31 +131,66 @@ systemctl --user enable --now whisper-typist.service
 echo "  NOTE: on first start GNOME shows ONE consent prompt - approve it."
 echo "  The socket appears only AFTER you approve (that gate is the security control)."
 
-# --- 8. GNOME hotkey ------------------------------------------------------
-say "Hotkey (Super+\\)"
+# --- 8. GNOME hotkeys -----------------------------------------------------
+say "Hotkeys (Super+\\, Super+Shift+\\)"
 SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
 KEY="custom-keybindings"
-# Find a free custom slot rather than clobbering existing ones.
-existing="$(gsettings get $SCHEMA $KEY)"
-slot=0
-while echo "$existing" | grep -q "custom$slot/"; do slot=$((slot+1)); done
-path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$slot/"
-if [ "$existing" = "@as []" ] || [ "$existing" = "[]" ]; then
-  newlist="['$path']"
-else
-  newlist="$(echo "$existing" | sed "s|]$|, '$path']|")"
-fi
-gsettings set $SCHEMA $KEY "$newlist"
-sub="$SCHEMA.custom-keybinding:$path"
-gsettings set "$sub" name "Whisper Dictation"
-gsettings set "$sub" command "$BIN/dictate-toggle"
-gsettings set "$sub" binding "<Super>backslash"
-echo "  bound Super+\\ -> dictate-toggle (slot custom$slot)"
+PREFIX="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
+
+# bind_key <name> <command> <binding>
+# Re-reads the slot list on every call, so binding several keys in one run does
+# not put them all in the same slot. Reuses the slot already holding <name>, so
+# re-running the installer updates a binding instead of adding a duplicate.
+bind_key() {
+  local name="$1" command="$2" binding="$3"
+  local existing slot path sub reuse=""
+  existing="$(gsettings get $SCHEMA $KEY)"
+
+  # Already installed under this name? Update that slot in place.
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    if echo "$existing" | grep -q "custom$i/"; then
+      if [ "$(gsettings get "$SCHEMA.custom-keybinding:$PREFIX/custom$i/" name 2>/dev/null)" = "'$name'" ]; then
+        reuse="$i"
+        break
+      fi
+    fi
+    i=$((i+1))
+  done
+
+  if [ -n "$reuse" ]; then
+    slot="$reuse"
+    path="$PREFIX/custom$slot/"
+  else
+    slot=0
+    while echo "$existing" | grep -q "custom$slot/"; do slot=$((slot+1)); done
+    path="$PREFIX/custom$slot/"
+    local newlist
+    if [ "$existing" = "@as []" ] || [ "$existing" = "[]" ]; then
+      newlist="['$path']"
+    else
+      newlist="$(echo "$existing" | sed "s|]$|, '$path']|")"
+    fi
+    gsettings set $SCHEMA $KEY "$newlist"
+  fi
+
+  sub="$SCHEMA.custom-keybinding:$path"
+  gsettings set "$sub" name "$name"
+  gsettings set "$sub" command "$command"
+  gsettings set "$sub" binding "$binding"
+  echo "  bound $binding -> ${command##*/} (slot custom$slot)"
+}
+
+bind_key "Whisper Dictation" "$BIN/dictate-toggle" "<Super>backslash"
+bind_key "Whisper Dictation Retype" "$BIN/dictate-toggle --retype" "<Super><Shift>backslash"
 
 say "Done"
 cat <<EOF
   Press Super+\\ to start dictation, speak, press again to stop and type.
   First use this login: approve the one GNOME consent prompt.
+
+  If the text went to the wrong window, or the inject failed, press
+  Super+Shift+\\ to type the last transcript into the window focused now.
 
   Controls:
     systemctl --user status  whisper-typist     # check daemon

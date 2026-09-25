@@ -2,6 +2,10 @@
 # Toggle dictation: first invocation starts recording, second stops, transcribes,
 # and types the result into the focused window via the RemoteDesktop portal.
 #
+# Run with --retype to re-type the last transcript into the window that has focus
+# now - the recovery path for when focus moved, or the inject failed, and the
+# words would otherwise be lost.
+#
 # State lives in $XDG_RUNTIME_DIR (user-only tmpfs). A flock guards against
 # double-press races. The recorder/transcriber/typer are overridable via env
 # vars so the state machine can be exercised with stubs in tests.
@@ -13,14 +17,52 @@ RUNTIME="${XDG_RUNTIME_DIR:-/tmp}"
 WAV="$RUNTIME/dictate.wav"
 PIDFILE="$RUNTIME/dictate.pid"
 LOCK="$RUNTIME/dictate.lock"
+# Last transcript, kept for --retype. Written 0600 before the inject is attempted
+# so a failed or misdirected type is always recoverable. On tmpfs it never
+# reaches disk and dies with the login session - but note that RUNTIME falls back
+# to /tmp, which may be real disk, if XDG_RUNTIME_DIR is unset.
+LAST="$RUNTIME/dictate.last"
 
 # Overridable commands (defaults are the real tools).
 RECORD_CMD="${WD_RECORD_CMD:-pw-record --rate 16000 --channels 1 --format s16}"
 TRANSCRIBE_CMD="${WD_TRANSCRIBE_CMD:-$PY $BASE/transcribe.py}"
 TYPE_CMD="${WD_TYPE_CMD:-$PY $BASE/portal_type.py}"
 NOTIFY_CMD="${WD_NOTIFY_CMD:-notify-send}"
+# Clipboard fallback, used only when an inject fails. wl-copy stays resident to
+# own the selection, so it is always launched detached with the lock FD closed.
+CLIP_CMD="${WD_CLIP_CMD:-wl-copy}"
+# Service start, overridable so tests never trigger a real consent prompt.
+DAEMON_START_CMD="${WD_DAEMON_START_CMD:-systemctl --user start whisper-typist}"
 
 notify() { $NOTIFY_CMD "Dictation" "$1" 2>/dev/null || true; }
+
+# Transcripts are not echoed in full: notifications persist in the shell's
+# notification history, and a whole dictated sentence does not belong there.
+notify_text() {
+  local label="$1" text="$2"
+  if [ "${#text}" -gt 40 ]; then
+    notify "$label: ${text:0:40}... (${#text} chars)"
+  else
+    notify "$label: $text"
+  fi
+}
+
+start_daemon() {
+  # Bypass systemd's RestartSec so the consent dialog appears now rather than
+  # after the restart delay. Detached, with the lock FD closed.
+  # shellcheck disable=SC2086
+  $DAEMON_START_CMD </dev/null >/dev/null 2>&1 9>&- &
+}
+
+# Put text on the clipboard so a failed inject never loses it. Best-effort: a
+# missing wl-copy is not an error, the stash is the real safety net.
+to_clipboard() {
+  command -v "${CLIP_CMD%% *}" >/dev/null 2>&1 || return 0
+  # No stdin redirect here: the text arrives through the pipe. The whole pipeline
+  # is backgrounded so wl-copy can hold the selection without blocking us.
+  # shellcheck disable=SC2086
+  printf '%s' "$1" | $CLIP_CMD >/dev/null 2>&1 9>&- &
+}
 
 # Mic selection: prefer a connected headset (Bluetooth or USB), else the
 # built-in mic. WD_SOURCE names a node to prefer over the ranking (it still
@@ -66,7 +108,7 @@ daemon_alive() {
 start_recording() {
   if ! daemon_alive; then
     notify "starting Whisper Dictation - approve the prompt, then press the dictation key"
-    systemctl --user start whisper-typist 9>&- &
+    start_daemon
     return
   fi
   resolve_source
@@ -126,14 +168,47 @@ stop_and_transcribe() {
     return
   fi
 
+  # Stash BEFORE attempting the inject: if the type fails, or lands in a window
+  # that stole focus while we were transcribing, --retype is the way back and it
+  # needs the text to already be on disk.
+  stash_text "$text"
+
   # shellcheck disable=SC2086
   if printf '%s' "$text" | $TYPE_CMD; then
-    notify "typed: $text"
+    notify_text "typed" "$text"
   else
-    notify "restarting Whisper Dictation - try again shortly"
-    # Daemon exited due to lost portal session; bypass systemd RestartSec so the
-    # consent dialog appears immediately rather than after the 15s restart delay.
-    systemctl --user start whisper-typist 9>&- &
+    # Clipboard first: the daemon restart below raises a consent dialog, and the
+    # text must already be safe before anything else can go wrong.
+    to_clipboard "$text"
+    notify "type failed - approve the prompt, then press the retype key (also on clipboard)"
+    # Daemon exited due to lost portal session.
+    start_daemon
+  fi
+}
+
+stash_text() {
+  # 0600 via umask in a subshell: the file holds dictated speech, and the tester's
+  # umask must not be able to widen it.
+  (umask 077; printf '%s' "$1" > "$LAST")
+}
+
+retype_last() {
+  if [ ! -s "$LAST" ]; then
+    notify "nothing to retype"
+    return
+  fi
+  local text
+  text="$(cat "$LAST")"
+  # shellcheck disable=SC2086
+  if printf '%s' "$text" | $TYPE_CMD; then
+    notify_text "retyped" "$text"
+    # Deliberately NOT cleared: a retype can land in the wrong window too, and
+    # that is exactly when a second attempt is needed. The next dictation
+    # overwrites it.
+  else
+    to_clipboard "$text"
+    notify "retype failed - approve the prompt and try again (also on clipboard)"
+    start_daemon
   fi
 }
 
@@ -144,10 +219,26 @@ _kill_orphaned_recorder() {
 }
 
 main() {
+  local mode="toggle"
+  case "${1:-}" in
+    "")        mode="toggle" ;;
+    --retype)  mode="retype" ;;
+    # Fail loudly: a typo in the hotkey's command must not silently fall through
+    # to starting a recording.
+    *)         notify "unknown option: $1"; exit 2 ;;
+  esac
+
   exec 9>"$LOCK"
   # Non-blocking: if another invocation holds the lock (e.g. a transcribe is
   # in progress), drop this press rather than queueing it - avoids stacking.
   flock -n 9 || { notify "busy, ignoring press"; exit 0; }
+
+  # Retype never touches the recorder state, so it is safe to press mid-recording.
+  if [ "$mode" = "retype" ]; then
+    retype_last
+    return
+  fi
+
   if [ -f "$PIDFILE" ]; then
     local pid
     pid="$(cat "$PIDFILE")"

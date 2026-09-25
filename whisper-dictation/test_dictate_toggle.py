@@ -29,6 +29,11 @@ def make_env(runtime, record="record", transcribe="transcribe", typer="typer"):
     env["WD_MUTE_CHECK_CMD"] = "true"  # prints nothing -> grep MUTED fails
     # pretend daemon is always alive so tests don't depend on a real socket
     env["WD_DAEMON_CHECK_CMD"] = "true"
+    # Never touch the real clipboard or the real service from a test: wl-copy
+    # would overwrite whatever the tester had copied, and systemctl would raise
+    # a GNOME consent prompt mid-run.
+    env["WD_CLIP_CMD"] = "true"
+    env["WD_DAEMON_START_CMD"] = "true"
     return env
 
 
@@ -188,46 +193,41 @@ def test_empty_audio_handled():
         assert not os.path.exists(typed), "nothing should be typed for empty audio"
 
 
-def test_daemon_down_fails_to_start_does_not_record():
-    """First press when daemon never starts must notify failure and NOT start recording."""
+def test_daemon_down_starts_service_and_does_not_record():
+    """Daemon down: the press starts the service and records nothing. The consent
+    prompt has to be approved first, so there is nothing to record into yet."""
     with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
         rec, tr, ty, _ = write_stubs(sd)
         env = make_env(rt, rec, tr, ty)
-        env["WD_DAEMON_CHECK_CMD"] = "false"  # daemon never comes alive
-        env["WD_DAEMON_START_CMD"] = "true"   # no-op service start
-        env["WD_DAEMON_START_WAIT"] = "2"     # fast timeout for tests
-        env["WD_DAEMON_START_POLL"] = "0"     # no sleep between polls
+        env["WD_DAEMON_CHECK_CMD"] = "false"  # daemon not alive
+        started = os.path.join(sd, "started.txt")
+        env["WD_DAEMON_START_CMD"] = write_marker(sd, "start_daemon", started)
         r = run_toggle(env)
         assert r.returncode == 0, r.stderr
+        assert wait_for(started), "daemon down must trigger a service start"
         assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
-            "daemon timeout must not start recording"
+            "daemon down must not start recording"
         assert not os.path.exists(os.path.join(rt, "dictate.wav")), \
-            "daemon timeout must not create a wav"
+            "daemon down must not create a wav"
 
 
-def test_daemon_down_then_starts_shows_ready_no_recording():
-    """First press when daemon starts during the wait must show ready and NOT auto-record."""
+def test_press_after_daemon_comes_up_records():
+    """The second press, once the daemon is alive, records normally - there is no
+    wait-and-retry inside a single press, the user presses again."""
     with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
         rec, tr, ty, _ = write_stubs(sd)
-        # A counter file: daemon_check returns false until it has been called twice,
-        # then returns true - simulates daemon coming up after a short delay.
-        counter = os.path.join(sd, "daemon_calls")
-        daemon_check = os.path.join(sd, "daemon_check.sh")
-        with open(daemon_check, "w") as f:
-            f.write(f'#!/usr/bin/env bash\n'
-                    f'n=$(cat {counter!r} 2>/dev/null || echo 0)\n'
-                    f'echo $((n+1)) > {counter!r}\n'
-                    f'[ "$n" -ge 2 ]\n')
-        os.chmod(daemon_check, 0o755)
         env = make_env(rt, rec, tr, ty)
-        env["WD_DAEMON_CHECK_CMD"] = f"bash {daemon_check}"
-        env["WD_DAEMON_START_CMD"] = "true"   # no-op service start
-        env["WD_DAEMON_START_WAIT"] = "10"
-        env["WD_DAEMON_START_POLL"] = "0"
+        env["WD_DAEMON_CHECK_CMD"] = "false"
+        run_toggle(env)  # daemon down: starts the service, records nothing
+        assert not os.path.exists(os.path.join(rt, "dictate.pid"))
+        env["WD_DAEMON_CHECK_CMD"] = "true"  # consent approved, daemon now alive
         r = run_toggle(env)
         assert r.returncode == 0, r.stderr
-        assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
-            "daemon startup press must not auto-start recording"
+        try:
+            assert os.path.exists(os.path.join(rt, "dictate.pid")), \
+                "press with a live daemon must start recording"
+        finally:
+            _kill_recorder(rt)
 
 
 def test_stale_empty_pidfile_starts_fresh_recording():
@@ -296,6 +296,34 @@ def write_picker(d, line):
         f.write(f'#!/usr/bin/env bash\ncat {fixture!r}\n')
     os.chmod(p, 0o755)
     return f"bash {p}"
+
+
+def write_marker(d, name, marker):
+    """A stub that records the fact it ran, for asserting a command was invoked."""
+    p = os.path.join(d, name)
+    with open(p, "w") as f:
+        f.write(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {marker!r}\n')
+    os.chmod(p, 0o755)
+    return f"bash {p}"
+
+
+def write_failing_typer(d):
+    """A typer stub that drains stdin and fails, like a dead portal session."""
+    p = os.path.join(d, "typer_fail")
+    with open(p, "w") as f:
+        f.write('#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n')
+    os.chmod(p, 0o755)
+    return f"bash {p}"
+
+
+def write_clip(d):
+    """A wl-copy stub that records what it was handed."""
+    out = os.path.join(d, "clipboard.txt")
+    p = os.path.join(d, "clip")
+    with open(p, "w") as f:
+        f.write(f'#!/usr/bin/env bash\ncat >> {out!r}\n')
+    os.chmod(p, 0o755)
+    return f"bash {p}", out
 
 
 def wait_for(path, timeout=5.0):
@@ -385,6 +413,111 @@ def test_mute_check_targets_picked_node():
                 "muted picked mic must not start recording"
         finally:
             _kill_recorder(rt)
+
+
+def test_successful_type_stashes_transcript():
+    """The transcript is kept for --retype, at mode 0600 - it is dictated speech."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd, transcript="mind the gap")
+        env = make_env(rt, rec, tr, ty)
+        run_toggle(env)
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        last = os.path.join(rt, "dictate.last")
+        assert os.path.exists(last), "transcript must be stashed for retype"
+        assert open(last).read() == "mind the gap"
+        mode = os.stat(last).st_mode & 0o777
+        assert mode == 0o600, f"stash must be 0600, got {oct(mode)}"
+
+
+def test_failed_type_stashes_and_copies_to_clipboard():
+    """The failure this whole feature exists for: the inject fails, and the words
+    survive in both the stash and the clipboard."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd, transcript="do not lose this")
+        clip, clip_out = write_clip(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_TYPE_CMD"] = write_failing_typer(sd)
+        env["WD_CLIP_CMD"] = clip
+        run_toggle(env)
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        last = os.path.join(rt, "dictate.last")
+        assert os.path.exists(last), "failed type must still leave a stash"
+        assert open(last).read() == "do not lose this"
+        assert wait_for(clip_out), "failed type must put the text on the clipboard"
+        assert open(clip_out).read() == "do not lose this"
+
+
+def test_retype_types_the_stashed_text():
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, typed = write_stubs(sd, transcript="second time lucky")
+        env = make_env(rt, rec, tr, ty)
+        run_toggle(env)
+        run_toggle(env)          # types once
+        os.remove(typed)         # forget that, we care about the retype
+        r = subprocess.run([TOGGLE, "--retype"], env=env, capture_output=True,
+                           text=True, timeout=15)
+        assert r.returncode == 0, r.stderr
+        assert open(typed).read() == "second time lucky"
+
+
+def test_retype_keeps_the_stash_for_another_attempt():
+    """A retype can land in the wrong window too, so the stash must survive it."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, typed = write_stubs(sd, transcript="again please")
+        env = make_env(rt, rec, tr, ty)
+        run_toggle(env)
+        run_toggle(env)
+        subprocess.run([TOGGLE, "--retype"], env=env, capture_output=True, timeout=15)
+        assert os.path.exists(os.path.join(rt, "dictate.last")), \
+            "stash must survive a retype"
+        subprocess.run([TOGGLE, "--retype"], env=env, capture_output=True, timeout=15)
+        assert open(typed).read() == "again please" * 3, \
+            "a second retype must work as well"
+
+
+def test_retype_with_no_stash_types_nothing():
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, typed = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        r = subprocess.run([TOGGLE, "--retype"], env=env, capture_output=True,
+                           text=True, timeout=15)
+        assert r.returncode == 0, r.stderr
+        assert not os.path.exists(typed), "nothing stashed means nothing typed"
+
+
+def test_retype_during_recording_leaves_the_recording_alone():
+    """Retype must be safe to press mid-recording: it touches no recorder state."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd, transcript="earlier text")
+        env = make_env(rt, rec, tr, ty)
+        run_toggle(env)
+        run_toggle(env)          # completed dictation, stash populated
+        run_toggle(env)          # start a new recording
+        pidfile = os.path.join(rt, "dictate.pid")
+        assert os.path.exists(pidfile)
+        before = open(pidfile).read()
+        try:
+            r = subprocess.run([TOGGLE, "--retype"], env=env, capture_output=True,
+                               text=True, timeout=15)
+            assert r.returncode == 0, r.stderr
+            assert os.path.exists(pidfile), "retype must not end the recording"
+            assert open(pidfile).read() == before, "retype must not touch the PID"
+        finally:
+            _kill_recorder(rt)
+
+
+def test_unknown_option_is_rejected():
+    """A typo in the hotkey command must fail loudly, not silently record."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd)
+        env = make_env(rt, rec, tr, ty)
+        r = subprocess.run([TOGGLE, "--retpye"], env=env, capture_output=True,
+                           text=True, timeout=15)
+        assert r.returncode == 2, f"expected exit 2, got {r.returncode}"
+        assert not os.path.exists(os.path.join(rt, "dictate.pid")), \
+            "a bad option must not start recording"
 
 
 if __name__ == "__main__":
