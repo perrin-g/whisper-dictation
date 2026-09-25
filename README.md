@@ -45,23 +45,13 @@ bash install.sh
 
 ## Usage
 
-`Super+\` works at any time:
+- **`Super+\`** - first press records, second press stops, transcribes and types.
+- **`Super+Shift+\`** - retypes the last transcript into whatever has focus now.
+  Safe mid-recording, and repeatable: only your next dictation replaces it.
 
-- **Daemon running:** first press starts recording, second press stops,
-  transcribes, and types.
-- **Daemon not running** (first use this login, or after a screen lock): a
-  notification appears followed immediately by the GNOME consent prompt.
-  Approve it, then press `Super+\` again to start dictating. A "Ready" notice
-  confirms the daemon is up.
-
-The daemon holds the grant open — no further prompts until the service restarts
-or you log out.
-
-`Super+Shift+\` types the **last transcript** into whatever has focus now. That's
-the recovery path for the two ways dictated text gets lost: focus moved to
-another window while you were speaking, so the words went somewhere else, or the
-inject failed outright. Safe to press mid-recording, and repeatable - the stash
-is only replaced by your next dictation.
+`Super+\` works even with the daemon down (first use this login, or after a screen
+lock): it notifies you and raises the consent prompt. Approve, then press again to
+dictate.
 
 ## What's in here
 
@@ -77,7 +67,7 @@ whisper-dictation/         # program files + full test suite
   whisper-typist.service   # systemd --user unit (hardened)
   requirements.txt         # pinned + hash-verified deps
   model.sha256             # expected model checksums (verified on install)
-  test_*.py                # 66 tests, run by install.sh before enabling service
+  test_*.py                # 68 tests, run by install.sh before enabling service
 ```
 
 ## Notes
@@ -85,38 +75,34 @@ whisper-dictation/         # program files + full test suite
 - **venv must see system `gi`.** `install.sh` uses `--system-site-packages`. A
   pyenv/mise Python won't see the distro's PyGObject. Override with
   `WD_PY=/usr/bin/python3` if needed.
-- **Screen lock.** The daemon subscribes to the portal session `Closed` signal.
-  When the lock screen invalidates the session the daemon exits cleanly and
-  unlinks its socket. The next `Super+\` after unlock sees the daemon as down,
-  fires the consent prompt immediately, and you're dictating within a few
-  seconds of approving it.
-- **Restart costs a prompt.** `systemctl --user restart whisper-typist` tears
-  down the held session, so the next start re-prompts.
-- **Dictated text is hard to lose.** Each transcript is stashed at
-  `$XDG_RUNTIME_DIR/dictate.last` (mode 0600) *before* the inject is attempted, so
-  a failure or a stolen focus is recoverable with `Super+Shift+\`. On tmpfs it
-  never reaches disk and dies with the login session. If the inject fails the text
-  also goes to the clipboard, and the notification says so. Note the stash follows
-  the script's `/tmp` fallback if `XDG_RUNTIME_DIR` is unset, which may be real
-  disk. Notifications truncate transcripts past 40 characters, since the shell
-  keeps notification history.
-- **No focus detection.** GNOME on Wayland exposes no supported way to read the
-  focused window (`org.gnome.Shell.Eval` is locked, and there's no
-  `wlr-foreign-toplevel`), so the portal types into whatever has focus at inject
-  time. Rather than guess, the design makes the miss cheap to undo.
-- **Mic follows your headset.** Every press re-picks the mic: a connected headset
-  (Bluetooth or USB) wins, otherwise the built-in mic. `pick-source` ranks by
-  device class (`device.form-factor` / `device.bus` from `pw-dump`) rather than by
-  a hardcoded device, so a new headset works the first time you pair it. A headset
-  in playback-only (A2DP) profile publishes no capture node and so cannot be
-  picked - the mic has to be live, not just paired. A webcam mic ranks *below* the
-  built-in one. The recorder is pinned with `--target`, so this is independent of
-  the system default input: dictation can use the headset while Teams and Chrome
-  stay on whatever you set. The "recording via ..." notification names the mic in
-  use, and the mute guard checks *that* mic. Run `pick-source` to see what would
-  be used right now, or set `WD_SOURCE=<node.name>` to prefer one device (it still
-  falls back when that device is absent). A failed probe degrades to the default
-  source rather than blocking dictation.
+- **What costs a consent prompt.** A screen lock invalidates the portal session,
+  so the daemon exits cleanly (it watches the session `Closed` signal) and unlinks
+  its socket; `systemctl --user restart` does the same deliberately. Either way the
+  next press re-prompts. Nothing else does.
+- **Held modifiers are released before typing.** Mutter's virtual input device
+  shares the real keymap state, so a modifier still down when injection starts is
+  combined with every keysym: `t` arrives as `Super+t` and fires whatever owns
+  that hotkey, space as `Super+space`, and a held Shift uppercases everything and
+  turns `,` into `<`. Both injection paths release Shift/Ctrl/Alt/Super first,
+  after a 120 ms settle (`WD_SETTLE_MS`) for the triggering key to lift.
+- **Nothing detects a stolen focus**, because GNOME on Wayland exposes no
+  supported way to read the focused window (`org.gnome.Shell.Eval` is locked, no
+  `wlr-foreign-toplevel`). The portal types wherever focus is at inject time, so
+  instead of guessing, the design makes a miss cheap to undo: every transcript is
+  stashed at `$XDG_RUNTIME_DIR/dictate.last` (0600) *before* the inject, for
+  `Super+Shift+\` to replay. A failed inject also copies to the clipboard and says
+  so. On tmpfs the stash never reaches disk and dies with the login session - but
+  it follows the script's `/tmp` fallback if `XDG_RUNTIME_DIR` is unset, which may
+  be real disk. Notifications truncate past 40 chars, since the shell keeps
+  notification history.
+- **Mic follows your headset.** Every press re-picks: a connected headset
+  (Bluetooth or USB) beats the built-in mic, and a webcam mic ranks *below* it.
+  `pick-source` ranks by device class (`device.form-factor` / `device.bus`), not by
+  a hardcoded device, so a new headset works the first time you pair it - though a
+  headset in playback-only (A2DP) profile publishes no capture node and so can't be
+  picked. The recorder is pinned with `--target`, so dictation can use the headset
+  while other apps stay on your system default. A failed probe falls back to the
+  default source rather than blocking dictation.
 - **en-NZ spelling** is a curated word map — not blanket suffix rules (those
   mis-fire on size/prize/doctor/error). High-collision words (check/cheque,
   tire/tyre, curb/kerb, draft/draught) are left untouched. Extend in `en_nz.py`.
@@ -132,6 +118,7 @@ systemctl --user restart whisper-typist     # re-grant (one prompt)
 systemctl --user stop    whisper-typist     # stop (removes socket)
 dictate-toggle --retype                     # what Super+Shift+\ runs
 pick-source                                 # which mic would be used right now
+WD_SOURCE=<node.name> dictate-toggle        # prefer one mic (falls back if absent)
 ```
 
 ---

@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 
-from portal_type import DEVICE_KEYBOARD, text_to_keysyms
+from portal_type import DEVICE_KEYBOARD, MODIFIER_KEYSYMS, text_to_keysyms
 
 # Portal D-Bus addressing (same target as the one-shot client).
 PORTAL = "org.freedesktop.portal.Desktop"
@@ -288,18 +288,40 @@ def establish_session(state, notify=True):
     state["Gio"] = Gio
 
 
-def _emit(state, text):
+# A modifier the user is still holding when injection starts gets combined with
+# every keysym sent: 't' arrives as Super+t (firing whatever owns that hotkey),
+# space as Super+space, and a held Shift uppercases the lot and turns ',' into
+# '<'. Releasing them first is what wtype and ydotool do. Shared with the one-shot
+# client so both injection paths behave the same.
+_MODIFIER_KEYSYMS = MODIFIER_KEYSYMS
+# The key that triggered this injection is still physically down, so give it a
+# moment to lift before clearing state. Overridable, and 0 in tests.
+_SETTLE_MS_DEFAULT = 120
+
+
+def _notify_keysym(state, keysym, pressed):
     bus = state["bus"]
     GLib = state["GLib"]
     Gio = state["Gio"]
-    sh = state["handle"]
+    bus.call_sync(
+        PORTAL, PATH, RD, "NotifyKeyboardKeysym",
+        GLib.Variant("(oa{sv}iu)", (state["handle"], {}, keysym, 1 if pressed else 0)),
+        None, Gio.DBusCallFlags.NONE, -1, None,
+    )
+
+
+def _emit(state, text):
+    settle_ms = int(os.environ.get("WD_SETTLE_MS", _SETTLE_MS_DEFAULT))
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
+    # Release-only: we never press these. Releasing a modifier that was not down
+    # is a no-op for the compositor; releasing one that IS down means it sees a
+    # second release when the user lifts the physical key, which is harmless.
+    for ks in _MODIFIER_KEYSYMS:
+        _notify_keysym(state, ks, False)
     for ks in text_to_keysyms(text):
-        for st in (1, 0):  # press, release
-            bus.call_sync(
-                PORTAL, PATH, RD, "NotifyKeyboardKeysym",
-                GLib.Variant("(oa{sv}iu)", (sh, {}, ks, st)),
-                None, Gio.DBusCallFlags.NONE, -1, None,
-            )
+        _notify_keysym(state, ks, True)
+        _notify_keysym(state, ks, False)
 
 
 def make_injector(state):

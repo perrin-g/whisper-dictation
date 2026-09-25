@@ -31,6 +31,16 @@ KEYSYM_TAB = 0xFF09
 # Unicode-to-keysym offset for characters outside Latin-1.
 KEYSYM_UNICODE_BASE = 0x01000000
 
+# Shift_L/R, Control_L/R, Alt_L/R, Super_L/R. Released before any injection:
+# Mutter's virtual input device shares the real keymap state, so a modifier the
+# user is still holding when injection starts is combined with every keysym sent.
+MODIFIER_KEYSYMS = (
+    0xFFE1, 0xFFE2,  # Shift_L, Shift_R
+    0xFFE3, 0xFFE4,  # Control_L, Control_R
+    0xFFE9, 0xFFEA,  # Alt_L, Alt_R
+    0xFFEB, 0xFFEC,  # Super_L, Super_R
+)
+
 
 def char_to_keysym(ch):
     """Map one character to its X keysym.
@@ -129,6 +139,10 @@ def type_text(text):
 
     def started(_results):
         sh = state["session_handle"]
+        # Clear any modifier still physically held, same as the daemon does.
+        for ks in MODIFIER_KEYSYMS:
+            call("NotifyKeyboardKeysym",
+                 GLib.Variant("(oa{sv}iu)", (sh, {}, ks, 0)))
         for ks in text_to_keysyms(text):
             for st in (1, 0):  # press, release
                 call("NotifyKeyboardKeysym",

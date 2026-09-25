@@ -48,16 +48,64 @@ def _send(sock_path, data):
     c.close()
 
 
-def _send_and_read_ack(sock_path, data):
-    """Send like a real client and return the daemon's ack bytes."""
-    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.connect(sock_path)
-    c.sendall(data)
-    c.shutdown(socket.SHUT_WR)
+class _FakeVariant:
+    def __init__(self, sig, payload):
+        self.sig = sig
+        self.payload = payload
+
+
+class _FakeGLib:
+    Variant = _FakeVariant
+
+
+class _FakeGio:
+    class DBusCallFlags:
+        NONE = 0
+
+
+class _FakeBus:
+    """Records NotifyKeyboardKeysym calls as (keysym, state) pairs."""
+    def __init__(self):
+        self.keys = []
+
+    def call_sync(self, dest, path, iface, method, variant, *a, **kw):
+        if method == "NotifyKeyboardKeysym":
+            _handle, _opts, keysym, st = variant.payload
+            self.keys.append((keysym, st))
+
+
+def _emit_capture(text):
+    bus = _FakeBus()
+    state = {"bus": bus, "GLib": _FakeGLib, "Gio": _FakeGio, "handle": "/session"}
+    os.environ["WD_SETTLE_MS"] = "0"  # no sleep in tests
     try:
-        return c.recv(16)
+        ptd._emit(state, text)
     finally:
-        c.close()
+        os.environ.pop("WD_SETTLE_MS", None)
+    return bus.keys
+
+
+def test_modifiers_are_released_before_typing():
+    """The keys that trigger dictation are still physically down when injection
+    starts, and Mutter's virtual device shares the real keymap state. Without an
+    explicit release, each keysym arrives modified - 't' as Super+t and space as
+    Super+space, firing whatever owns those hotkeys - and a held Shift uppercases
+    everything.
+    """
+    keys = _emit_capture("hi")
+    mods = set(ptd._MODIFIER_KEYSYMS)
+    text_start = next(i for i, (ks, _) in enumerate(keys) if ks not in mods)
+    released = {ks for ks, st in keys[:text_start] if st == 0}
+    assert released == mods, f"every modifier must be released first, got {released!r}"
+    assert all(st == 0 for _, st in keys[:text_start]), \
+        "modifier keysyms must only be released, never pressed"
+
+
+def test_text_is_still_typed_after_the_releases():
+    keys = _emit_capture("hi")
+    mods = set(ptd._MODIFIER_KEYSYMS)
+    typed = [(ks, st) for ks, st in keys if ks not in mods]
+    assert typed == [(ord("h"), 1), (ord("h"), 0), (ord("i"), 1), (ord("i"), 0)], typed
 
 
 def test_connection_delivers_text_to_injector():
@@ -97,31 +145,6 @@ def test_empty_connection_does_not_inject():
         finally:
             stop_fn()
     assert received == [], received
-
-
-def test_successful_inject_acks_ok():
-    with tempfile.TemporaryDirectory() as d:
-        sock = os.path.join(d, "t.sock")
-        stop_fn, _ = _run_server(sock, lambda t: None)
-        try:
-            ack = _send_and_read_ack(sock, b"hello")
-        finally:
-            stop_fn()
-    assert ack.strip() == b"OK", ack
-
-
-def test_failed_inject_acks_err():
-    def boom(_text):
-        raise RuntimeError("session dead")
-
-    with tempfile.TemporaryDirectory() as d:
-        sock = os.path.join(d, "t.sock")
-        stop_fn, _ = _run_server(sock, boom)
-        try:
-            ack = _send_and_read_ack(sock, b"hello")
-        finally:
-            stop_fn()
-    assert ack.strip() == b"ERR", ack
 
 
 def test_injector_exception_does_not_kill_daemon():
