@@ -293,10 +293,11 @@ def establish_session(state, notify=True):
 # space as Super+space, and a held Shift uppercases the lot and turns ',' into
 # '<'. Releasing them first is what wtype and ydotool do. Shared with the one-shot
 # client so both injection paths behave the same.
+# Releasing cannot clear a modifier the user is PHYSICALLY holding - that state
+# belongs to the real device and the compositor takes the union across devices.
+# It only helps when a hotkey grab has latched one. The wait for real keys to lift
+# is dictate-toggle's job, since only it knows which trigger fired.
 _MODIFIER_KEYSYMS = MODIFIER_KEYSYMS
-# The key that triggered this injection is still physically down, so give it a
-# moment to lift before clearing state. Overridable, and 0 in tests.
-_SETTLE_MS_DEFAULT = 120
 
 
 def _notify_keysym(state, keysym, pressed):
@@ -311,9 +312,8 @@ def _notify_keysym(state, keysym, pressed):
 
 
 def _emit(state, text):
-    settle_ms = int(os.environ.get("WD_SETTLE_MS", _SETTLE_MS_DEFAULT))
-    if settle_ms > 0:
-        time.sleep(settle_ms / 1000.0)
+    # The wait for a held trigger key to lift happens in dictate-toggle, which knows
+    # which hotkey fired; by here the caller has already settled.
     # Release-only: we never press these. Releasing a modifier that was not down
     # is a no-op for the compositor; releasing one that IS down means it sees a
     # second release when the user lifts the physical key, which is harmless.

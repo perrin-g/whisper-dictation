@@ -46,8 +46,9 @@ bash install.sh
 ## Usage
 
 - **`Super+\`** - first press records, second press stops, transcribes and types.
-- **`Super+Shift+\`** - retypes the last transcript into whatever has focus now.
-  Safe mid-recording, and repeatable: only your next dictation replaces it.
+- **Every dictation also lands on the clipboard**, so if the text went to the wrong
+  window or the inject failed, `Ctrl+V` puts it where you wanted it. No second
+  hotkey - see the modifier note below for why that matters.
 
 `Super+\` works even with the daemon down (first use this login, or after a screen
 lock): it notifies you and raises the consent prompt. Approve, then press again to
@@ -67,7 +68,7 @@ whisper-dictation/         # program files + full test suite
   whisper-typist.service   # systemd --user unit (hardened)
   requirements.txt         # pinned + hash-verified deps
   model.sha256             # expected model checksums (verified on install)
-  test_*.py                # 68 tests, run by install.sh before enabling service
+  test_*.py                # 70 tests, run by install.sh before enabling service
 ```
 
 ## Notes
@@ -79,19 +80,27 @@ whisper-dictation/         # program files + full test suite
   so the daemon exits cleanly (it watches the session `Closed` signal) and unlinks
   its socket; `systemctl --user restart` does the same deliberately. Either way the
   next press re-prompts. Nothing else does.
-- **Held modifiers are released before typing.** Mutter's virtual input device
-  shares the real keymap state, so a modifier still down when injection starts is
-  combined with every keysym: `t` arrives as `Super+t` and fires whatever owns
-  that hotkey, space as `Super+space`, and a held Shift uppercases everything and
-  turns `,` into `<`. Both injection paths release Shift/Ctrl/Alt/Super first,
-  after a 120 ms settle (`WD_SETTLE_MS`) for the triggering key to lift.
+- **Never bind an injecting action to a modified hotkey.** Mutter's virtual input
+  device shares the real keymap state, so a modifier still physically down when
+  injection starts is combined with every keysym sent: `t` arrives as `Super+t` and
+  fires whatever owns that hotkey, space as `Super+space`, `l` as `Super+L` (screen
+  lock), and a held Shift uppercases everything and turns `,` into `<`. Releasing
+  the modifiers first does *not* fix it - a virtual device cannot clear a key held
+  on the real keyboard, and GNOME exposes no way to read the modifier state. The
+  mitigations are a `WD_SETTLE_MS` (250 ms) wait for the key to lift, which is why
+  dictation is safe in practice (transcription adds a second of cover), and keeping
+  recovery on the clipboard rather than a second injecting hotkey. `--retype` still
+  exists for the command line, where nothing is held.
 - **Nothing detects a stolen focus**, because GNOME on Wayland exposes no
   supported way to read the focused window (`org.gnome.Shell.Eval` is locked, no
   `wlr-foreign-toplevel`). The portal types wherever focus is at inject time, so
   instead of guessing, the design makes a miss cheap to undo: every transcript is
-  stashed at `$XDG_RUNTIME_DIR/dictate.last` (0600) *before* the inject, for
-  `Super+Shift+\` to replay. A failed inject also copies to the clipboard and says
-  so. On tmpfs the stash never reaches disk and dies with the login session - but
+  stashed at `$XDG_RUNTIME_DIR/dictate.last` (0600) *before* the inject, and copied
+  to the clipboard, so `Ctrl+V` or `dictate-toggle --retype` recovers it. The
+  clipboard is the widest exposure of the three: XWayland bridges it, so any X11
+  client can read it without focus, and it lingers until the next copy. Harden with
+  `WD_CLIP_CMD="wl-copy --paste-once"` if that matters more to you than pasting
+  twice. On tmpfs the stash never reaches disk and dies with the login session - but
   it follows the script's `/tmp` fallback if `XDG_RUNTIME_DIR` is unset, which may
   be real disk. Notifications truncate past 40 chars, since the shell keeps
   notification history.
@@ -116,7 +125,7 @@ whisper-dictation/         # program files + full test suite
 systemctl --user status  whisper-typist     # is the daemon up?
 systemctl --user restart whisper-typist     # re-grant (one prompt)
 systemctl --user stop    whisper-typist     # stop (removes socket)
-dictate-toggle --retype                     # what Super+Shift+\ runs
+dictate-toggle --retype                     # type the last transcript again
 pick-source                                 # which mic would be used right now
 WD_SOURCE=<node.name> dictate-toggle        # prefer one mic (falls back if absent)
 ```

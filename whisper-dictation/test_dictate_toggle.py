@@ -34,6 +34,8 @@ def make_env(runtime, record="record", transcribe="transcribe", typer="typer"):
     # a GNOME consent prompt mid-run.
     env["WD_CLIP_CMD"] = "true"
     env["WD_DAEMON_START_CMD"] = "true"
+    # No settle delay in tests; the real one exists to let a held hotkey lift.
+    env["WD_SETTLE_MS"] = "0"
     return env
 
 
@@ -428,6 +430,21 @@ def test_successful_type_stashes_transcript():
         assert open(last).read() == "mind the gap"
         mode = os.stat(last).st_mode & 0o777
         assert mode == 0o600, f"stash must be 0600, got {oct(mode)}"
+
+
+def test_every_dictation_copies_to_the_clipboard():
+    """Ctrl+V is the recovery path for a stolen focus, so the copy must happen on
+    success too - not only when the inject fails."""
+    with tempfile.TemporaryDirectory() as rt, tempfile.TemporaryDirectory() as sd:
+        rec, tr, ty, _ = write_stubs(sd, transcript="copy me too")
+        clip, clip_out = write_clip(sd)
+        env = make_env(rt, rec, tr, ty)
+        env["WD_CLIP_CMD"] = clip
+        run_toggle(env)
+        r = run_toggle(env)
+        assert r.returncode == 0, r.stderr
+        assert wait_for(clip_out), "a successful dictation must still be copied"
+        assert open(clip_out).read() == "copy me too"
 
 
 def test_failed_type_stashes_and_copies_to_clipboard():

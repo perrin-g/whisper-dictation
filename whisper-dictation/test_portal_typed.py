@@ -77,11 +77,7 @@ class _FakeBus:
 def _emit_capture(text):
     bus = _FakeBus()
     state = {"bus": bus, "GLib": _FakeGLib, "Gio": _FakeGio, "handle": "/session"}
-    os.environ["WD_SETTLE_MS"] = "0"  # no sleep in tests
-    try:
-        ptd._emit(state, text)
-    finally:
-        os.environ.pop("WD_SETTLE_MS", None)
+    ptd._emit(state, text)
     return bus.keys
 
 

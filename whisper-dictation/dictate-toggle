@@ -2,9 +2,10 @@
 # Toggle dictation: first invocation starts recording, second stops, transcribes,
 # and types the result into the focused window via the RemoteDesktop portal.
 #
-# Run with --retype to re-type the last transcript into the window that has focus
-# now - the recovery path for when focus moved, or the inject failed, and the
-# words would otherwise be lost.
+# Every transcript also goes to the clipboard, so if the text lands in the wrong
+# window (focus moved while transcribing) or the inject fails, Ctrl+V recovers it
+# with no extra hotkey. --retype types the stash again instead; command line only,
+# since injecting from a modified hotkey is what caused misfires (see settle()).
 #
 # State lives in $XDG_RUNTIME_DIR (user-only tmpfs). A flock guards against
 # double-press races. The recorder/transcriber/typer are overridable via env
@@ -52,6 +53,19 @@ start_daemon() {
   # after the restart delay. Detached, with the lock FD closed.
   # shellcheck disable=SC2086
   $DAEMON_START_CMD </dev/null >/dev/null 2>&1 9>&- &
+}
+
+# Wait for the trigger key to physically lift before injecting. Nothing can read
+# the modifier state (GNOME exposes no API for it), and a release event from our
+# virtual device cannot clear a key held on the real keyboard - the compositor
+# takes the union across devices. So a modifier still down when injection starts
+# is combined with every keysym: 't' fires Super+t, 'l' fires Super+L (screen
+# lock). This delay is a mitigation, not a guarantee: hold the key longer than the
+# settle and it misfires again.
+SETTLE_MS="${WD_SETTLE_MS:-250}"
+settle() {
+  [ "$SETTLE_MS" -gt 0 ] 2>/dev/null || return 0
+  sleep "$(awk "BEGIN{print $SETTLE_MS/1000}")"
 }
 
 # Put text on the clipboard so a failed inject never loses it. Best-effort: a
@@ -168,19 +182,20 @@ stop_and_transcribe() {
     return
   fi
 
-  # Stash BEFORE attempting the inject: if the type fails, or lands in a window
-  # that stole focus while we were transcribing, --retype is the way back and it
-  # needs the text to already be on disk.
+  # Stash and copy BEFORE attempting the inject, so the text is already safe if the
+  # type fails or lands in a window that stole focus while we were transcribing.
+  # The clipboard copy is unconditional: it makes Ctrl+V the recovery path for
+  # every failure mode, with no second hotkey to press (and no hotkey means no
+  # held modifier can turn the recovery itself into Super+key presses).
   stash_text "$text"
+  to_clipboard "$text"
 
+  settle
   # shellcheck disable=SC2086
   if printf '%s' "$text" | $TYPE_CMD; then
-    notify_text "typed" "$text"
+    notify_text "typed (also on clipboard)" "$text"
   else
-    # Clipboard first: the daemon restart below raises a consent dialog, and the
-    # text must already be safe before anything else can go wrong.
-    to_clipboard "$text"
-    notify "type failed - approve the prompt, then press the retype key (also on clipboard)"
+    notify "type failed - on the clipboard, press Ctrl+V. Approve the prompt to restore dictation"
     # Daemon exited due to lost portal session.
     start_daemon
   fi
@@ -192,6 +207,9 @@ stash_text() {
   (umask 077; printf '%s' "$1" > "$LAST")
 }
 
+# Types the stash. Command line only - deliberately NOT bound to a hotkey, because
+# injecting from a modified hotkey is what turned dictated text into Super+key
+# presses. The clipboard copy on every dictation covers the same need safely.
 retype_last() {
   if [ ! -s "$LAST" ]; then
     notify "nothing to retype"
@@ -199,6 +217,7 @@ retype_last() {
   fi
   local text
   text="$(cat "$LAST")"
+  settle
   # shellcheck disable=SC2086
   if printf '%s' "$text" | $TYPE_CMD; then
     notify_text "retyped" "$text"
@@ -233,7 +252,7 @@ main() {
   # in progress), drop this press rather than queueing it - avoids stacking.
   flock -n 9 || { notify "busy, ignoring press"; exit 0; }
 
-  # Retype never touches the recorder state, so it is safe to press mid-recording.
+  # Retype touches no recorder state, so it is safe to run mid-recording.
   if [ "$mode" = "retype" ]; then
     retype_last
     return

@@ -60,14 +60,14 @@ def test_no_token_machinery():
     ), "no restore_token file should exist on disk"
 
 
-def test_send_via_daemon_unreachable_when_no_socket():
+def test_send_via_daemon_reports_unreachable_when_no_socket():
     with tempfile.TemporaryDirectory() as d:
         missing = os.path.join(d, "nope.sock")
         assert pt.send_via_daemon("hi", sock_path=missing) == "unreachable"
 
 
-def _listener_that_replies(sock, reply, received):
-    """Accept one connection, record the text, and send back `reply` bytes."""
+def _fake_daemon(sock, received, ack=b"OK"):
+    """A listener that records what it was sent and acks like the real daemon."""
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock)
     srv.listen(1)
@@ -81,21 +81,21 @@ def _listener_that_replies(sock, reply, received):
                 break
             chunks.append(b)
         received.append(b"".join(chunks).decode("utf-8"))
-        if reply is not None:
-            conn.sendall(reply)
+        if ack is not None:
+            conn.sendall(ack)
         conn.close()
 
     t = threading.Thread(target=accept_one, daemon=True)
     t.start()
+    time.sleep(0.1)
     return srv, t
 
 
-def test_send_via_daemon_ok_when_daemon_acks_ok():
+def test_send_via_daemon_delivers_to_listener():
     received = []
     with tempfile.TemporaryDirectory() as d:
         sock = os.path.join(d, "t.sock")
-        srv, t = _listener_that_replies(sock, b"OK", received)
-        time.sleep(0.1)
+        srv, t = _fake_daemon(sock, received)
         status = pt.send_via_daemon("café 😀", sock_path=sock)
         t.join(5)
         srv.close()
@@ -103,35 +103,22 @@ def test_send_via_daemon_ok_when_daemon_acks_ok():
     assert received == ["café 😀"], received
 
 
-def test_send_via_daemon_inject_failed_when_daemon_acks_err():
+def test_send_via_daemon_reports_inject_failed_without_an_ok_ack():
+    """A daemon that was reached but could not inject must not be read as success -
+    the caller has to know the text did not land."""
     received = []
     with tempfile.TemporaryDirectory() as d:
         sock = os.path.join(d, "t.sock")
-        srv, t = _listener_that_replies(sock, b"ERR", received)
-        time.sleep(0.1)
+        srv, t = _fake_daemon(sock, received, ack=b"ERR")
         status = pt.send_via_daemon("hi", sock_path=sock)
         t.join(5)
         srv.close()
     assert status == "inject_failed", status
 
 
-def test_send_via_daemon_inject_failed_when_no_ack():
-    # Daemon reached but closes without acking (e.g. old daemon / crash mid-ack)
-    # -> treat as failure, never a false success.
-    received = []
-    with tempfile.TemporaryDirectory() as d:
-        sock = os.path.join(d, "t.sock")
-        srv, t = _listener_that_replies(sock, None, received)
-        time.sleep(0.1)
-        status = pt.send_via_daemon("hi", sock_path=sock)
-        t.join(5)
-        srv.close()
-    assert status == "inject_failed", status
-
-
-def test_send_via_daemon_unreachable_on_stale_socket():
-    # Socket file exists but nobody is listening -> connect fails -> unreachable,
-    # so main() falls through to the one-shot path.
+def test_send_via_daemon_reports_unreachable_on_stale_socket():
+    # Socket file exists but nobody is listening -> connect fails. No fallback to
+    # a one-shot session: that would silently re-prompt for consent.
     with tempfile.TemporaryDirectory() as d:
         sock = os.path.join(d, "t.sock")
         dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

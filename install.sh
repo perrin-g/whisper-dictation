@@ -181,16 +181,18 @@ bind_key() {
   echo "  bound $binding -> ${command##*/} (slot custom$slot)"
 }
 
+# One hotkey only. --retype injects, and injecting from a modified hotkey turns the
+# transcript into Super+key presses (Super+t, Super+L) when the modifier is still
+# held; every dictation copies to the clipboard instead, so Ctrl+V is the recovery.
 bind_key "Whisper Dictation" "$BIN/dictate-toggle" "<Super>backslash"
-bind_key "Whisper Dictation Retype" "$BIN/dictate-toggle --retype" "<Super><Shift>backslash"
 
 say "Done"
 cat <<EOF
   Press Super+\\ to start dictation, speak, press again to stop and type.
   First use this login: approve the one GNOME consent prompt.
 
-  If the text went to the wrong window, or the inject failed, press
-  Super+Shift+\\ to type the last transcript into the window focused now.
+  Every dictation also goes to the clipboard, so if the text landed in the
+  wrong window, or the inject failed, just press Ctrl+V where you want it.
 
   Controls:
     systemctl --user status  whisper-typist     # check daemon
