@@ -14,7 +14,12 @@ SHARE="$HOME/.local/share/whisper-dictation"
 BIN="$HOME/.local/bin"
 UNIT="$HOME/.config/systemd/user/whisper-typist.service"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/whisper-dictation"
-MODEL_REPO="https://huggingface.co/Systran/faster-whisper-small.en"
+# Pinned to an exact upstream commit (the repo's last, 2023-11-23) so a re-upload
+# can't change what we fetch. Trust still comes from model.sha256, checked below;
+# bump MODEL_REV and model.sha256 together. WD_MODEL_REV overrides it (the
+# checksums are still enforced).
+MODEL_REV="${WD_MODEL_REV:-d1d751a5f8271d482d14ca55d9e2deeebbae577f}"
+MODEL_URL="https://huggingface.co/Systran/faster-whisper-small.en/resolve/$MODEL_REV"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 die() { printf '\033[31merror: %s\033[0m\n' "$1" >&2; exit 1; }
@@ -32,16 +37,16 @@ say "System packages"
 # pw-record (mic capture) and pw-dump + jq (mic ranking in pick-source),
 # libnotify's notify-send (toasts), python3 venv.
 if command -v apt-get >/dev/null; then
-  PKGS="python3-gi gir1.2-glib-2.0 python3-venv pipewire-bin libnotify-bin jq"
+  PKGS="python3-gi gir1.2-glib-2.0 python3-venv pipewire-bin libnotify-bin jq socat wl-clipboard git"
   INSTALL="sudo apt-get install -y $PKGS"
 elif command -v dnf >/dev/null; then
-  PKGS="python3-gobject glib2 pipewire-utils libnotify jq"
+  PKGS="python3-gobject glib2 pipewire-utils libnotify jq socat wl-clipboard git"
   INSTALL="sudo dnf install -y $PKGS"
 elif command -v pacman >/dev/null; then
-  PKGS="python-gobject glib2 pipewire libnotify jq"
+  PKGS="python-gobject glib2 pipewire libnotify jq socat wl-clipboard git"
   INSTALL="sudo pacman -S --needed $PKGS"
 else
-  die "no known package manager (apt/dnf/pacman). Install PyGObject, GLib introspection, pipewire (pw-record, pw-dump), jq, libnotify manually, then re-run with WD_SKIP_PKGS=1."
+  die "no known package manager (apt/dnf/pacman). Install PyGObject, GLib introspection, pipewire (pw-record, pw-dump), jq, socat, wl-clipboard, git, libnotify manually, then re-run with WD_SKIP_PKGS=1."
 fi
 if [ "${WD_SKIP_PKGS:-0}" = "1" ]; then
   echo "  WD_SKIP_PKGS=1 -> skipping package install"
@@ -102,27 +107,53 @@ say "Model (small.en) -> $SHARE/model"
 if [ -d "$SHARE/model" ] && (cd "$SHARE/model" && sha256sum -c "$SHARE/model.sha256" >/dev/null 2>&1); then
   echo "  model present and checksums match - skipping download"
 else
-  command -v git >/dev/null || die "git needed to fetch the model"
-  command -v git-lfs >/dev/null || echo "  note: git-lfs recommended for large model files"
-  [ -d "$SHARE/model" ] && mv "$SHARE/model" "$SHARE/model.old.$$"
-  GIT_LFS_SKIP_SMUDGE=0 git clone --depth 1 "$MODEL_REPO" "$SHARE/model"
+  command -v curl >/dev/null || die "curl is needed to fetch the model"
+  # Download each file into a staging dir (resumable: a half-finished *.part is
+  # continued on re-run), verify the lot, and only then swap it into place.
+  STAGE="$SHARE/model.partial"
+  mkdir -p "$STAGE"
+  while read -r want name; do
+    [ -n "$name" ] || continue
+    if [ -f "$STAGE/$name.part" ] && [ "$(sha256sum "$STAGE/$name.part" | cut -d' ' -f1)" = "$want" ]; then
+      mv "$STAGE/$name.part" "$STAGE/$name"   # finished earlier, never renamed
+    fi
+    if [ -f "$STAGE/$name" ] && [ "$(sha256sum "$STAGE/$name" | cut -d' ' -f1)" = "$want" ]; then
+      echo "  have $name"; continue
+    fi
+    echo "  fetching $name"
+    rc=0
+    curl -fL --retry 3 -C - -o "$STAGE/$name.part" "$MODEL_URL/$name" || rc=$?
+    if [ "$rc" = "22" ]; then
+      die "HTTP error fetching $MODEL_URL/$name - most likely a 404: the pinned model revision is gone. Fix: (1) 'git pull' for an installer with a newer pin; or (2) WD_MODEL_REV=<commit-or-main> bash install.sh (checksums are still enforced, so if the files differ you must update model.sha256 yourself); or (3) download the files listed in model.sha256 into $SHARE/model by hand and re-run."
+    elif [ "$rc" != "0" ]; then
+      die "download failed (curl exit $rc) - network problem. Re-run to resume."
+    fi
+    mv "$STAGE/$name.part" "$STAGE/$name"
+  done < "$SHARE/model.sha256"
   echo "  verifying checksums..."
-  (cd "$SHARE/model" && sha256sum -c "$SHARE/model.sha256") || \
-    die "model checksum mismatch - the upstream model may have changed. Inspect before trusting; do not bypass. Old model (if any) preserved at $SHARE/model.old.$$"
+  (cd "$STAGE" && sha256sum -c "$SHARE/model.sha256") || {
+    rm -rf "$STAGE"
+    die "model checksum mismatch - the download is corrupt or the pinned revision changed. Inspect before trusting; do not bypass."
+  }
+  [ -d "$SHARE/model" ] && mv "$SHARE/model" "$SHARE/model.old.$$"
+  mv "$STAGE" "$SHARE/model"
   [ -d "$SHARE/model.old.$$" ] && echo "  (old model preserved at $SHARE/model.old.$$ - remove when satisfied)"
 fi
 
 # --- 6. run the test suite ------------------------------------------------
 say "Test suite"
 fail=0
+TESTLOG="$(mktemp "${TMPDIR:-/tmp}/wd_test.XXXXXX")"
 for t in "$SHARE"/test_*.py; do
-  if "$SHARE/venv/bin/python" "$t" >/tmp/wd_test.out 2>&1; then
+  if "$SHARE/venv/bin/python" "$t" >"$TESTLOG" 2>&1; then
     echo "  PASS $(basename "$t")"
   else
-    echo "  FAIL $(basename "$t") - see /tmp/wd_test.out"; fail=1
+    echo "  FAIL $(basename "$t") - see $TESTLOG"; fail=1
+    cat "$TESTLOG" >> "$TESTLOG.failed"
   fi
 done
-[ "$fail" = "0" ] || die "tests failed - stopping before enabling the service"
+[ "$fail" = "0" ] || die "tests failed - stopping before enabling the service (log: $TESTLOG.failed)"
+rm -f "$TESTLOG"
 
 # --- 7. systemd user service ----------------------------------------------
 say "Resident typist service"

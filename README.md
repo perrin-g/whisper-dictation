@@ -5,7 +5,9 @@ Offline voice dictation for GNOME/Wayland: press `Super+\`, speak, press again;
 (no cloud, no network calls), the text is rewritten to en-NZ spelling, and it's
 typed into whatever window has focus.
 
-Built and tested on Ubuntu, GNOME 50, Wayland.
+Built on Ubuntu (GNOME 50, Wayland). Clean-install tested on Fedora 44
+(GNOME 50.6, Python 3.14) with `dnf`; the `apt` path is the original target and the
+`pacman` package list is untested.
 
 ## Why not uinput
 
@@ -33,15 +35,34 @@ compositor-mediated channel GNOME uses for screen-sharing and remote-control:
 - PipeWire (`pw-record` to capture, `pw-dump` to enumerate mics) and `jq`
 - System Python 3 with distro PyGObject
 - `socat`
+- `wl-clipboard` (`wl-copy`) for the clipboard copy - optional, the stash still works without it
 - `wpctl` (WirePlumber) for the mute guard - optional, a missing `wpctl` just
   skips the check
-- ~500 MB disk for the `small.en` model
+- `git` and `curl` (to fetch this repo and the model)
+- ~500 MB disk for the `small.en` model, ~120 MB for the Python packages
+- Network access during install only; dictation itself makes no network calls
 
 ## Install
 
 ```bash
+git clone https://github.com/perrin-g/whisper-dictation
+cd whisper-dictation
 bash install.sh
 ```
+
+The installer asks once before its single `sudo` step (distro packages), then:
+installs the Python packages (pinned and hash-verified), downloads the
+`faster-whisper-small.en` model from a pinned Hugging Face revision and checks it
+against `model.sha256`, runs the 70 tests, starts the `whisper-typist` service and
+binds `Super+\`. It refuses to enable the service if anything fails. Re-running
+is safe.
+
+When it finishes, press `Super+\`, approve the one GNOME consent prompt, then
+dictate: press again to start, once more to stop and type.
+
+Overrides: `WD_SKIP_PKGS=1` skips the package step, `WD_PY=/usr/bin/python3` picks
+the Python for the venv, `WD_MODEL_REV=<commit>` fetches a different model revision
+(checksums are still enforced).
 
 ## Usage
 
@@ -69,6 +90,8 @@ whisper-dictation/         # program files + full test suite
   requirements.txt         # pinned + hash-verified deps
   model.sha256             # expected model checksums (verified on install)
   test_*.py                # 70 tests, run by install.sh before enabling service
+                           # (they run against the installed copy in
+                           # ~/.local/share/whisper-dictation, not the checkout)
 ```
 
 ## Notes
@@ -91,6 +114,12 @@ whisper-dictation/         # program files + full test suite
 - **en-NZ spelling** is a curated word map — not blanket suffix rules (those
   mis-fire on size/prize/doctor/error). High-collision words (check/cheque,
   tire/tyre, curb/kerb, draft/draught) are left untouched. Extend in `en_nz.py`.
+- **Model download fails with an HTTP error (likely 404).** The pinned model
+  revision has been removed upstream. Run `git pull` for a newer pin, or set
+  `WD_MODEL_REV=<commit-or-main>` - if the files differ you must update
+  `model.sha256` yourself, since the checksums are always enforced - or place the
+  four files listed in `model.sha256` in `~/.local/share/whisper-dictation/model`
+  and re-run. A network error just needs a re-run; the download resumes.
 - **Hash mismatch on `pip install`** means the target's Python/arch wants a
   different wheel. Regenerate hashes on the target — keep them pinned, don't
   drop `--require-hashes`.

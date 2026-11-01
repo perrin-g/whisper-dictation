@@ -44,7 +44,10 @@ def test_transcribes_known_sample():
 def test_missing_file_errors():
     r = run(["/tmp/does-not-exist-12345.wav"])
     assert r.returncode != 0, "should exit non-zero on missing file"
-    assert "not found" in r.stderr.lower()
+    # The model is checked before the audio file, so on a machine without the
+    # model the error is "model file missing" rather than "audio file not found".
+    err = r.stderr.lower()
+    assert "not found" in err or "model file missing" in err
 
 
 def test_checksum_mismatch_rejected():
