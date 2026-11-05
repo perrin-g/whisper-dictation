@@ -6,8 +6,8 @@ Offline voice dictation for GNOME/Wayland: press `Super+\`, speak, press again;
 typed into whatever window has focus.
 
 Built on Ubuntu (GNOME 50, Wayland). Clean-install tested on Fedora 44
-(GNOME 50.6, Python 3.14) with `dnf`; the `apt` path is the original target and the
-`pacman` package list is untested.
+(GNOME 50.6, Python 3.14) with `dnf`, and running on Fedora 45 (Python 3.15); the
+`apt` path is the original target and the `pacman` package list is untested.
 
 ## Why not uinput
 
@@ -33,13 +33,13 @@ compositor-mediated channel GNOME uses for screen-sharing and remote-control:
 
 - GNOME (Shell 50+) on **Wayland**
 - PipeWire (`pw-record` to capture, `pw-dump` to enumerate mics) and `jq`
-- System Python 3 with distro PyGObject
+- System Python 3.12-3.15 (x86_64) with distro PyGObject
 - `socat`
 - `wl-clipboard` (`wl-copy`) for the clipboard copy - optional, the stash still works without it
 - `wpctl` (WirePlumber) for the mute guard - optional, a missing `wpctl` just
   skips the check
 - `git` and `curl` (to fetch this repo and the model)
-- ~500 MB disk for the `small.en` model, ~120 MB for the Python packages
+- ~500 MB disk for the `small.en` model, ~60 MB for the Python packages
 - Network access during install only; dictation itself makes no network calls
 
 ## Install
@@ -121,8 +121,14 @@ whisper-dictation/         # program files + full test suite
   four files listed in `model.sha256` in `~/.local/share/whisper-dictation/model`
   and re-run. A network error just needs a re-run; the download resumes.
 - **Hash mismatch on `pip install`** means the target's Python/arch wants a
-  different wheel. Regenerate hashes on the target — keep them pinned, don't
-  drop `--require-hashes`.
+  wheel the lock doesn't list. `requirements.txt` carries the official PyPI
+  x86_64 wheel hashes for CPython 3.12-3.15, so this usually means a newer
+  Python (a distro upgrade) or a non-x86_64 machine. Add that wheel's
+  `--hash=sha256:` line under the package (from its PyPI "Download files"
+  page or `pip download` + `pip hash`) — keep everything pinned, don't drop
+  `--require-hashes`. Install with `--no-deps`: the lock deliberately leaves
+  out `onnxruntime` (only faster-whisper's VAD filter uses it, and dictation
+  doesn't enable VAD) and `pyyaml` (never imported).
 
 ## Caveats
 
@@ -217,8 +223,9 @@ is in this directory. Do this:
 3. Run `bash install.sh`. It will pause before the one `sudo` package step —
    let me approve it. If `import gi` fails in the venv check, re-run with
    `WD_PY=/usr/bin/python3`. If the pinned `pip install` fails on a hash
-   mismatch, regenerate the hashes on this machine but keep them pinned and
-   hash-verified — do not drop `--require-hashes`.
+   mismatch, add this machine's wheel hashes to `requirements.txt` (see the
+   README's "Hash mismatch" note) but keep them pinned and hash-verified — do
+   not drop `--require-hashes` or `--no-deps`.
 4. After install, confirm all tests passed (install.sh stops if not) and the
    `whisper-typist` service is active. Tell me to approve the first GNOME
    consent prompt, then verify the socket appears at

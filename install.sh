@@ -84,6 +84,9 @@ case "$SYS_PY" in
      echo "           fails below, re-run with WD_PY=/usr/bin/python3" ;;
 esac
 PY_FOR_VENV="${WD_PY:-$SYS_PY}"
+# requirements.txt carries wheel hashes for CPython 3.12-3.15 only.
+"$PY_FOR_VENV" -c 'import sys; sys.exit(not ((3, 12) <= sys.version_info[:2] <= (3, 15)))' || \
+  die "$("$PY_FOR_VENV" -V 2>&1) is outside the supported 3.12-3.15 range (requirements.txt has no wheel hashes for it). See README 'Hash mismatch' to extend the lock."
 "$PY_FOR_VENV" -m venv --system-site-packages "$SHARE/venv"
 "$SHARE/venv/bin/python" - <<'EOF' || die "PyGObject (gi) not visible in venv - install the system GObject package and re-run with WD_PY=/usr/bin/python3"
 import gi  # noqa
@@ -94,11 +97,13 @@ EOF
 
 # --- 4. pinned, hash-verified dependencies --------------------------------
 say "Python dependencies (pinned + hash-verified)"
-# If a hash mismatches (different wheel for the target's Python/arch), pip will
-# refuse. In that case regenerate hashes on the target with pip-compile or pip
-# download, but keep them pinned.
+# requirements.txt is a complete lock with x86_64 wheel hashes for CPython
+# 3.12-3.15. --no-deps because it deliberately omits faster-whisper's
+# onnxruntime dependency (only used by the VAD filter, which transcribe.py
+# doesn't enable) and huggingface-hub's pyyaml (never imported here). If a hash
+# mismatches (new Python/arch), add that wheel's hash - keep everything pinned.
 "$SHARE/venv/bin/pip" install --upgrade pip >/dev/null
-"$SHARE/venv/bin/pip" install --require-hashes -r "$SHARE/requirements.txt" || \
+"$SHARE/venv/bin/pip" install --no-deps --require-hashes -r "$SHARE/requirements.txt" || \
   die "pinned install failed - likely a wheel-hash mismatch for this Python/arch. Regenerate requirements.txt hashes on the target (see README), keep them pinned, and re-run."
 
 # --- 5. model: download + checksum verify ---------------------------------
