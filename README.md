@@ -5,10 +5,6 @@ Offline voice dictation for GNOME/Wayland: press `Super+\`, speak, press again;
 (no cloud, no network calls), the text is rewritten to en-NZ spelling, and it's
 typed into whatever window has focus.
 
-Built on Ubuntu (GNOME 50, Wayland). Clean-install tested on Fedora 44
-(GNOME 50.6, Python 3.14) with `dnf`, and running on Fedora 45 (Python 3.15); the
-`apt` path is the original target and the `pacman` package list is untested.
-
 ## Why not uinput
 
 Most Linux voice tools inject via `/dev/uinput`. That requires root or `input`
@@ -41,6 +37,8 @@ compositor-mediated channel GNOME uses for screen-sharing and remote-control:
 - `git` and `curl` (to fetch this repo and the model)
 - ~500 MB disk for the `small.en` model, ~60 MB for the Python packages
 - Network access during install only; dictation itself makes no network calls
+
+Tested on Fedora 44–45; the Arch (`pacman`) package list is untested.
 
 ## Install
 
